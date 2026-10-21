@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Roblox Creator Asset Tracker
-// @namespace    https://www.github.com/annaroblox
-// @version      1.0.0
-// @description  Collects every asset you view on the Roblox Creator Dashboard, keeps ONE deduped record per Asset ID (name, description, thumbnail, type), sorts assets into Approved / Pending / Moderated, lets you search + sort them, and periodically re-checks pending assets until they are reviewed.
+// @namespace   https://www.github.com/annaroblox
+// @version      1.2.0
+// @description  Collects every asset you view on the Roblox Creator Dashboard, keeps ONE deduped record per Asset ID (name, description, thumbnail, type), sorts assets into Approved / Pending / Moderated, lets you search, sort, inspect, multi-select and bulk-manage assets, periodically re-checks pending assets and refreshes approved metadata/status, can purge or skip moderated assets without relogging them, exports JSON, CSV, or a categorized HTML report, and can open as a live full-page tracker linked to the same logs.
 // @author       annaroblox
 // @match        https://create.roblox.com/*
 // @match        https://www.roblox.com/develop*
@@ -27,18 +27,17 @@
 // @noframes
 // @license      MIT
 // ==/UserScript==
-
 (function () {
   'use strict';
 
-  // Only run on dashboard-like pages (not create.roblox.com/docs etc.) //
+  /* Only run on dashboard-like pages (not create.roblox.com/docs etc.) */
   try {
     var _host = location.hostname;
     var _path = location.pathname;
     if (_host === 'create.roblox.com' && !/^\/(dashboard|store|marketplace|creator|configure)/.test(_path)) return;
   } catch (e) { /* ignore */ }
 
-  // ============================== CONFIG (TWEAK) ============================== //
+  /* ============================== CONFIG  ============================== */
   var CONFIG = {
     debug: false,                    // true = verbose console logging, prefix [RCAT]
     thumbnailBatchSize: 20,          // thumbnails API errors above ~20 Image-type ids per call
@@ -46,15 +45,19 @@
     thumbnailWidth: 420,
     eagerThumbnailCount: 12,         // first images load immediately; the rest use the progressive queue
     thumbnailLoadConcurrency: 6,     // max card images decoding/loading at once
-    renderBatchSize: 120,            // cards rendered at a time (Show more reveals the next batch)
+    renderBatchSize: 120,            // cards rendered at a time (Load More reveals the next batch)
     scanDebounceMs: 700,
     enrichDelayMs: 350,              // gap between description back-fill requests
     recheckConcurrency: 3,
+    approvedRefreshBatchSize: 30,   // stale approved assets refreshed per auto wakeup
+    approvedRefreshWakeMinutes: 60, // wake cadence when pending auto-recheck is Off
+    bulkOpenLimit: 10,              // avoid accidental tab floods from bulk Open
     maxHistoryEntries: 25,
-    defaultRecheckMinutes: 5
+    defaultRecheckMinutes: 5,
+    defaultApprovedRefreshHours: 24
   };
 
-  /* Status keyword lists (TWEAK) — matched against short badge/label texts.
+  /* Status keyword lists  — matched against short badge/label texts.
      Order matters: moderated phrases are checked first so that e.g.
      "Not approved" is never read as approved. */
   var MOD_WORDS = [
@@ -87,7 +90,7 @@
     70: 'Left Shoe Accessory', 71: 'Right Shoe Accessory', 72: 'Dress/Skirt Accessory'
   };
 
-  /* URL path segment -> asset type  */
+  /* URL path segment -> asset type */
   var TYPE_BY_SEGMENT = {
     'decals': 'Decal', 'decal': 'Decal', 'images': 'Image', 'image': 'Image',
     'audio': 'Audio', 'sounds': 'Audio', 'sound': 'Audio', 'videos': 'Video', 'video': 'Video',
@@ -169,6 +172,7 @@
 
   var DEFAULT_SETTINGS = {
     recheckMinutes: CONFIG.defaultRecheckMinutes,
+    approvedRefreshHours: CONFIG.defaultApprovedRefreshHours,
     autoScan: true,
     notifyDesktop: true,
     enrichDescriptions: true,
@@ -186,7 +190,8 @@
 
   var ui = {
     tab: 'all', search: '', typeFilter: '', panelOpen: false, settingsOpen: false,
-    renderLimit: CONFIG.renderBatchSize, detailsId: '', fullPage: false
+    renderLimit: CONFIG.renderBatchSize, detailsId: '', fullPage: false,
+    selectedIds: new Set(), lastSelectedId: '', lastRenderedIds: []
   };
   var lastScanAt = 0, lastRecheckAt = 0, nextRecheckAt = 0;
   var recheckRunning = false, recheckProgress = '';
@@ -212,7 +217,7 @@
   function assetActivityAt(a) {
     if (!a) return 0;
     return Math.max(
-      Number(a.lastStatusChange || 0), Number(a.lastChecked || 0),
+      Number(a.lastStatusChange || 0), Number(a.statusObservedAt || 0), Number(a.lastChecked || 0),
       Number(a.lastSeen || 0), Number(a.thumbnailCheckedAt || 0),
       Number(a.descCheckedAt || 0), Number(a.updated || 0), Number(a.firstSeen || 0)
     ) || 0;
@@ -367,6 +372,35 @@
     return null;
   }
 
+  /* Strict DOM badge parser. Unlike statusFromText (used for structured API
+     values), this accepts only a complete short label such as "Under
+     review" or "Status: Approved". Sentences/navigation text such as
+     "Moderated assets", "Deleted items", or moderation-policy warnings are
+     deliberately NOT statuses. This prevents broad configure-page UI copy
+     from marking the configured asset moderated. */
+  function statusFromBadgeText(text) {
+    if (!text) return null;
+    var t = String(text).replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    t = t.replace(/^(?:asset\s+)?(?:status|moderation status|review status)\s*:\s*/, '');
+    t = t.replace(/^[^\w\[]+/, '').replace(/[.!]+$/, '').trim();
+    var MAP = {
+      'approved': 'approved', 'passed moderation': 'approved', 'ready to sell': 'approved',
+      'review approved': 'approved', 'reviewed approved': 'approved',
+      'pending': 'pending', 'pending review': 'pending', 'under review': 'pending',
+      'in review': 'pending', 'reviewing': 'pending', 'awaiting review': 'pending',
+      'waiting for review': 'pending', 'in moderation': 'pending',
+      'moderation pending': 'pending', 'not reviewed': 'pending', 'processing': 'pending',
+      'moderated': 'moderated', 'rejected': 'moderated', 'blocked': 'moderated',
+      'content deleted': 'moderated', '[content deleted]': 'moderated',
+      '[ content deleted ]': 'moderated', 'failed moderation': 'moderated',
+      'moderation failed': 'moderated', 'failed review': 'moderated',
+      'did not pass': 'moderated', 'not approved': 'moderated',
+      'declined': 'moderated', 'denied': 'moderated', 'deleted': 'moderated',
+      'removed': 'moderated'
+    };
+    return MAP[t] || null;
+  }
+
   /* Map any Roblox-ish status string to approved|pending|moderated|null.
      Handles Open Cloud values (MODERATION_STATE_APPROVED / Reviewing /
      Rejected), dashboard strings, and ModerationStatus enum names. */
@@ -404,7 +438,7 @@
       status: 'unknown', rawStatus: '', statusSource: '', statusConfidence: 0,
       created: 0, updated: 0, creatorName: '', creatorId: '', isArchived: false,
       pageUrl: '', firstSeen: now, lastSeen: now, lastChecked: 0, lastStatusChange: 0,
-      descCheckedAt: 0, unseenChange: false, statusHistory: []
+      statusObservedAt: 0, descCheckedAt: 0, unseenChange: false, statusHistory: []
     };
   }
 
@@ -440,18 +474,26 @@
   function applyStatus(asset, status, confidence, source, raw) {
     if (!status || status === 'unknown') return false;
     confidence = confidence || 0;
+    var now = Date.now();
     var old = asset.status || 'unknown';
     if (status === old) {
+      asset.statusObservedAt = now;
       if (confidence > (asset.statusConfidence || 0)) {
         asset.statusConfidence = confidence; asset.statusSource = source || asset.statusSource;
         if (raw) asset.rawStatus = String(raw);
       }
       return false;
     }
+    var freshApiSignal = /^api:/.test(String(source || ''));
     var accept = false;
     if (old === 'unknown') accept = true;
     else if (status === 'pending' && (old === 'approved' || old === 'moderated') && confidence < 5) accept = false; // stale page guard
     else if (old === 'pending') accept = confidence >= 2;   // pending is transient: fresh signals win
+    // Approved/moderated are not immutable forever. During an explicit API
+    // recheck, a fresh strong signal (explicit state, Blocked thumbnail, or
+    // [Content Deleted] economy name) may correct an older resolved status
+    // even if that older observation had confidence 5.
+    else if (freshApiSignal && confidence >= 4 && (status === 'approved' || status === 'moderated')) accept = true;
     else accept = confidence >= (asset.statusConfidence || 0);
     if (!accept) return false;
 
@@ -459,9 +501,10 @@
     asset.statusConfidence = confidence;
     asset.statusSource = source || '';
     if (raw) asset.rawStatus = String(raw);
-    asset.lastStatusChange = Date.now();
+    asset.statusObservedAt = now;
+    asset.lastStatusChange = now;
     asset.statusHistory = asset.statusHistory || [];
-    asset.statusHistory.push({ s: status, at: Date.now(), src: source || '' });
+    asset.statusHistory.push({ s: status, at: now, src: source || '' });
     if (asset.statusHistory.length > CONFIG.maxHistoryEntries) asset.statusHistory = asset.statusHistory.slice(-CONFIG.maxHistoryEntries);
     if (old !== 'unknown') { asset.unseenChange = true; queueChangeNote(asset, old, status); }
     return true;
@@ -490,11 +533,13 @@
     if (!a.thumbnail) return true;
     var width = Number(a.thumbnailWidth || 0) || guessThumbnailWidth(a.thumbnail, null);
     if (width > 0 && width < CONFIG.thumbnailWidth) return true;
+    // Older records have no width metadata. Refresh each such asset once;
     // thumbnailCheckedAt is set by our 420px API request afterwards.
     return !a.thumbnailCheckedAt;
   }
 
-
+  /* Removed-list helpers. DB.ignored[id] may be a legacy timestamp number
+     or { at, reason }; only truthiness blocks (re)logging. */
   function blockAsset(id, reason) {
     DB.ignored[String(id)] = { at: Date.now(), reason: reason || 'removed' };
   }
@@ -505,6 +550,94 @@
       if (ignoredReason(DB.ignored[k]).indexOf('moderated') === 0) n++;
     });
     return n;
+  }
+
+  /* Multi-selection is session/UI state, not DB state. IDs are pruned
+     whenever records disappear (purge, cross-tab removal, clear DB, etc.). */
+  function pruneSelection() {
+    if (!ui.selectedIds || typeof ui.selectedIds.forEach !== 'function') ui.selectedIds = new Set();
+    ui.selectedIds.forEach(function (id) { if (!DB.assets[String(id)]) ui.selectedIds.delete(id); });
+    if (ui.lastSelectedId && !DB.assets[String(ui.lastSelectedId)]) ui.lastSelectedId = '';
+    return ui.selectedIds;
+  }
+  function selectedAssetIds() {
+    pruneSelection();
+    var out = [], seen = {};
+    function add(id) {
+      id = String(id);
+      if (!seen[id] && DB.assets[id] && ui.selectedIds.has(id)) { seen[id] = true; out.push(id); }
+    }
+    try { visibleAssets().forEach(function (a) { add(a.id); }); } catch (e) {}
+    ui.selectedIds.forEach(add);
+    return out;
+  }
+  function setAssetSelected(id, on) {
+    id = String(id);
+    pruneSelection();
+    if (on) {
+      if (!DB.assets[id]) return false;
+      ui.selectedIds.add(id);
+    } else ui.selectedIds.delete(id);
+    ui.lastSelectedId = id;
+    syncSelectionUI();
+    return ui.selectedIds.has(id);
+  }
+  function clearSelection() {
+    pruneSelection();
+    ui.selectedIds.clear();
+    ui.lastSelectedId = '';
+    syncSelectionUI();
+  }
+
+  /* Shared manual/bulk removal: delete records and persistently block IDs
+     just like the single-card ✕ action. */
+  function removeAssetsByIds(ids, reason, options) {
+    options = options || {};
+    var seen = {}, unique = [];
+    (ids || []).forEach(function (rawId) {
+      var id = String(rawId);
+      if (!seen[id] && DB.assets[id]) { seen[id] = true; unique.push(id); }
+    });
+    if (!unique.length) return 0;
+    unique.forEach(function (id) {
+      delete DB.assets[id];
+      blockAsset(id, reason || 'removed-manual-bulk');
+      if (ui.selectedIds) ui.selectedIds.delete(id);
+    });
+    try {
+      if (Array.isArray(enrichQueue)) {
+        for (var i = enrichQueue.length - 1; i >= 0; i--) {
+          if (unique.indexOf(String(enrichQueue[i])) !== -1) enrichQueue.splice(i, 1);
+        }
+      }
+    } catch (e) {}
+    try {
+      if (Array.isArray(highResQueue)) {
+        for (var j = highResQueue.length - 1; j >= 0; j--) {
+          if (unique.indexOf(String(highResQueue[j])) !== -1) highResQueue.splice(j, 1);
+        }
+      }
+      if (highResQueued) unique.forEach(function (id) { delete highResQueued[id]; });
+    } catch (e) {}
+    if (ui.detailsId && unique.indexOf(String(ui.detailsId)) !== -1) closeAssetDetails();
+    pruneSelection();
+    saveDBNow();
+    renderAll();
+    if (!options.quiet) {
+      toast('Removed ' + unique.length + ' selected asset' + (unique.length === 1 ? '' : 's') +
+        ' and added their IDs to the removed list (Settings can reset it).');
+    }
+    log('removed assets:', unique.length, 'reason:', reason || 'removed-manual-bulk');
+    return unique.length;
+  }
+  function removeSelectedAssetsWithConfirm() {
+    var ids = selectedAssetIds();
+    if (!ids.length) { toast('No assets are selected.'); return 0; }
+    if (!window.confirm('Remove ' + ids.length + ' selected asset(s) from the tracker?\n\n' +
+      'Their Asset IDs go onto the removed list, so rescanning the dashboard will NOT log them again.\n' +
+      'Your actual Roblox assets are not changed.\n\n' +
+      '(To undo later: Settings → Reset removed list, then rescan.)')) return 0;
+    return removeAssetsByIds(ids, 'removed-manual-bulk');
   }
 
   /* Remove ONLY moderated assets, then block their IDs persistently so a
@@ -764,6 +897,10 @@
   }
 
   function harvestFromJSON(json, sourceUrl, sourceLabel) {
+    // Dashboard network capture is automatic collection, so it must obey
+    // the Auto-scan setting exactly like DOM scanning. Direct/manual API
+    // harvest calls with another label remain available for tests/tools.
+    if (!settings.autoScan && sourceLabel === 'dashboard-api') return 0;
     var recs = extractAll(json);
     var changed = 0;
     for (var i = 0; i < recs.length; i++) if (upsertAsset(recs[i], sourceLabel || 'dashboard-api')) changed++;
@@ -828,7 +965,7 @@
   }
 
   function patchNetwork() {
-    // Inject into the page (most reliable where CSP allows).
+    // 1) Inject into the page (most reliable where CSP allows).
     try {
       var s = document.createElement('script');
       s.textContent = '(' + __rcatPageInterceptor.toString() + ')();';
@@ -864,6 +1001,7 @@
         if (e.origin !== location.origin) return;
         var d = e.data;
         if (!d || d.tag !== '__rcat_net_v1' || typeof d.body !== 'string') return;
+        if (!settings.autoScan) return; // browsing must not collect via network when Auto-scan is OFF
         var h = d.url + '|' + d.body.length + '|' + d.body.slice(0, 100);
         if (recentNet.has(h)) return;
         recentNet.add(h);
@@ -1098,10 +1236,14 @@
   }
 
   /* ============================== re-check engine ============================== */
-  async function recheckAssets(ids, reason) {
-    if (recheckRunning) { toast('A re-check is already running…'); return; }
+  async function recheckAssets(ids, reason, options) {
+    options = options || {};
+    if (recheckRunning) {
+      if (!options.quiet) toast('A re-check is already running…');
+      return 0;
+    }
     ids = (ids || []).filter(function (id) { return !!DB.assets[id]; });
-    if (!ids.length) { if (reason === 'manual') toast('Nothing to re-check.'); return; }
+    if (!ids.length) { if (reason === 'manual') toast('Nothing to re-check.'); return 0; }
     recheckRunning = true;
     updateRecheckUI();
     log('recheck start (' + reason + ') for', ids.length, 'assets');
@@ -1113,7 +1255,10 @@
         var explicit = !!explicitDone[id];
         if (!explicit) explicit = await fetchExplicitDetails(id);
         var b = DB.assets[id];
-        if (b && (!explicit || !b.description || !b.created || !b.name)) await fetchEconomyDetails(id);
+        // Approved/manual refreshes deliberately fetch economy details even
+        // when fields already exist, so later name/description edits and a
+        // [Content Deleted] name are noticed instead of only filling blanks.
+        if (b && (options.refreshMetadata || !explicit || !b.description || !b.created || !b.name)) await fetchEconomyDetails(id);
         var c = DB.assets[id]; if (c) c.lastChecked = Date.now();
       }, function (d, t) { recheckProgress = 'Checking ' + d + '/' + t; updateStatusBar(); });
       lastRecheckAt = Date.now();
@@ -1125,6 +1270,7 @@
     updateRecheckUI();
     scheduleRecheck();
     log('recheck done');
+    return ids.length;
   }
 
   function pendingIds() {
@@ -1134,14 +1280,68 @@
     }).sort(function (a, b) { return (DB.assets[a].lastChecked || 0) - (DB.assets[b].lastChecked || 0); });
   }
 
-  function recheckPending(reason) {
-    var ids = pendingIds();
+  function approvedIdsOldestFirst() {
+    return Object.keys(DB.assets).filter(function (id) {
+      return DB.assets[id].status === 'approved';
+    }).sort(function (a, b) {
+      var av = DB.assets[a].lastChecked || DB.assets[a].statusObservedAt || 0;
+      var bv = DB.assets[b].lastChecked || DB.assets[b].statusObservedAt || 0;
+      return av - bv;
+    });
+  }
+
+  function staleApprovedIds(limit) {
+    var hours = Number(settings.approvedRefreshHours) || 0;
+    if (hours <= 0) return [];
+    var cutoff = Date.now() - hours * 3600000;
+    var ids = approvedIdsOldestFirst().filter(function (id) {
+      var a = DB.assets[id];
+      return (a.lastChecked || a.statusObservedAt || 0) <= cutoff;
+    });
+    return (limit && limit > 0) ? ids.slice(0, limit) : ids;
+  }
+
+  function refreshApprovedAssets(reason, options) {
+    options = options || {};
+    var ids;
+    if (options.forceAll) ids = approvedIdsOldestFirst();
+    else if (options.forceBatch) ids = approvedIdsOldestFirst().slice(0, options.limit || 100);
+    else ids = staleApprovedIds(options.limit || CONFIG.approvedRefreshBatchSize);
     if (!ids.length) {
+      if (options.manual) {
+        toast(approvedIdsOldestFirst().length
+          ? 'Approved assets are already within their refresh interval.'
+          : 'No approved assets are currently tracked.');
+      }
+      return Promise.resolve(0);
+    }
+    if (options.announce) {
+      toast('Refreshing ' + ids.length + ' approved asset(s), oldest-checked first, for current status/name/description…');
+    }
+    return recheckAssets(ids, reason || 'approved-refresh', {
+      refreshMetadata: true,
+      quiet: !!options.quiet
+    });
+  }
+
+  async function recheckPending(reason) {
+    var isAuto = /^auto/.test(String(reason || ''));
+    var ids = pendingIds();
+    if (ids.length) {
+      await recheckAssets(ids, reason);
+    } else {
       if (reason === 'manual') toast('No pending assets to re-check 🎉');
       scheduleRecheck();
-      return Promise.resolve();
     }
-    return recheckAssets(ids, reason);
+    // Approved records can later be removed/re-moderated or renamed. On the
+    // normal auto wakeups, refresh only a bounded oldest-first stale batch;
+    // recheckAssets reschedules the timer when this second pass finishes.
+    if (isAuto && !recheckRunning) {
+      var stale = staleApprovedIds(CONFIG.approvedRefreshBatchSize);
+      if (stale.length) {
+        await recheckAssets(stale, 'approved-auto', { refreshMetadata: true, quiet: true });
+      }
+    }
   }
 
   var recheckTimer = null;
@@ -1149,9 +1349,12 @@
     if (recheckTimer) { clearTimeout(recheckTimer); recheckTimer = null; }
     nextRecheckAt = 0;
     var mins = Number(settings.recheckMinutes) || 0;
-    if (mins <= 0) { updateStatusBar(); return; }
-    nextRecheckAt = Date.now() + mins * 60000;
-    recheckTimer = setTimeout(function () { recheckPending('auto'); }, mins * 60000);
+    var delayMins = mins > 0
+      ? mins
+      : (((Number(settings.approvedRefreshHours) || 0) > 0) ? CONFIG.approvedRefreshWakeMinutes : 0);
+    if (delayMins <= 0) { updateStatusBar(); return; }
+    nextRecheckAt = Date.now() + delayMins * 60000;
+    recheckTimer = setTimeout(function () { recheckPending('auto'); }, delayMins * 60000);
     updateStatusBar();
   }
 
@@ -1185,7 +1388,7 @@
     afterDBChange();
   }
 
-  /* ============================== DOM scanning  ============================== */
+  /* ============================== DOM scanning ) ============================== */
   function typeFromPath(path) {
     var segs = String(path || '').toLowerCase().split('/').filter(Boolean);
     for (var i = segs.length - 1; i >= 0; i--) if (TYPE_BY_SEGMENT[segs[i]]) return TYPE_BY_SEGMENT[segs[i]];
@@ -1263,14 +1466,12 @@
       for (var j = 0; j < texts.length; j++) {
         var t = texts[j];
         if (!t || t.length > 48) continue;
-        var s = statusFromText(t);
+        // Exact badge labels only. Do NOT substring-search arbitrary UI copy
+        // or class names: words in navigation/help/warnings are not the
+        // status of this specific asset.
+        var s = statusFromBadgeText(t);
         if (s === 'moderated' || s === 'pending') return { status: s, raw: t };
         if (s === 'approved' && !approvedHit) approvedHit = { status: s, raw: t };
-      }
-      var cls = (typeof el.className === 'string') ? el.className.replace(/[-_]/g, ' ') : '';
-      if (cls) {
-        var cs = statusFromText(cls);
-        if (cs === 'moderated' || cs === 'pending') return { status: cs, raw: 'class:' + el.className.slice(0, 40) };
       }
     }
     return approvedHit;
@@ -1284,7 +1485,7 @@
       if (t.length < 2 || t.length > 140) return false;
       if (/^\d+$/.test(t)) return false;
       if (GENERIC[t.toLowerCase()]) return false;
-      if (statusFromText(t) && /^(approved|pending|under review|in review|reviewing|moderated|blocked|content deleted|rejected|ready to sell)$/i.test(t)) return false;
+      if (statusFromBadgeText(t)) return false;
       return true;
     }
     var cands = [];
@@ -1357,6 +1558,12 @@
     };
   }
 
+  function currentDetailAssetId() {
+    if (!/(configure|overview|details|edit|store\/asset|\/library\/|\/catalog\/)/i.test(location.pathname)) return '';
+    var ex = extractIdFromHref(location.href);
+    return ex ? String(ex.id) : '';
+  }
+
   function scanCards(force) {
     var cands = [];
     var anchors = document.querySelectorAll('a[href]');
@@ -1375,10 +1582,15 @@
     if (!force && sig === lastScanSignature) return 0;
     lastScanSignature = sig;
     var pageType = guessPageType();
+    var detailId = currentDetailAssetId();
     var seen = {}, changed = 0;
     for (i = 0; i < cands.length; i++) {
       if (seen[cands[i].id]) continue;
       seen[cands[i].id] = 1;
+      // On a configure/detail page, scanDetailPage below is authoritative
+      // for the page's own asset. Generic card-context extraction around a
+      // breadcrumb/self link can pick up unrelated moderation UI copy.
+      if (detailId && String(cands[i].id) === detailId) continue;
       var card = findCard(cands[i].el);
       if (upsertAsset(extractFromCard(card, cands[i], pageType), 'page')) changed++;
     }
@@ -1387,9 +1599,9 @@
   }
 
   function scanDetailPage() {
-    var ex = extractIdFromHref(location.href);
-    if (!ex) return 0;
-    if (!/(configure|overview|details|edit|store\/asset|\/library\/|\/catalog\/)/i.test(location.pathname)) return 0;
+    var detailId = currentDetailAssetId();
+    if (!detailId) return 0;
+    var ex = extractIdFromHref(location.href) || { id: detailId, hintType: '' };
     var main = document.querySelector('main') || document.body;
     if (!main) return 0;
     var name = '', desc = '';
@@ -1421,15 +1633,22 @@
       if (candidateThumb.width > bestDetailThumb.width) bestDetailThumb = candidateThumb;
       if (!bestDetailThumb.url && candidateThumb.url) bestDetailThumb = candidateThumb;
     }
-    var st = scanStatusIn(main);
-    var sig = ex.id + '|' + name + '|' + desc.length + '|' + (st ? st.status : '') + '|' + bestDetailThumb.url;
+    // IMPORTANT: do not infer moderation status from a configure/detail
+    // page's DOM. Those pages contain navigation labels, deletion controls,
+    // and policy/help text with words like "moderated" and "deleted" that
+    // do not describe this asset. Status here comes from structured
+    // dashboard/API data and rechecks; this scan only merges the actual
+    // Name, Description, type, URL, and thumbnail fields. (The one
+    // exception is inherent to upsertAsset: if the asset's actual Name
+    // field itself is "[Content Deleted]", that is a real signal.)
+    var sig = ex.id + '|' + name + '|' + desc.length + '|' + bestDetailThumb.url;
     if (sig === lastDetailSignature) return 0;
     lastDetailSignature = sig;
     var changed = upsertAsset({
       id: ex.id, name: name, description: desc,
       thumbnail: bestDetailThumb.url, thumbnailWidth: bestDetailThumb.width,
       type: ex.hintType || guessPageType(),
-      status: st ? st.status : null, statusConfidence: st ? 4 : 0, rawStatus: st ? st.raw : '',
+      status: null, statusConfidence: 0, rawStatus: '',
       url: location.href
     }, 'detail-page');
     return changed ? 1 : 0;
@@ -1437,6 +1656,10 @@
 
   function scanPage(reason, force) {
     if (!document.body) return 0;
+    // Central Auto-scan guard: all browsing/init/navigation/observer scans
+    // stop when OFF, even if a future caller forgets to check the setting.
+    // Explicit user actions pass force=true or reason='manual'.
+    if (!settings.autoScan && !force && reason !== 'manual') return 0;
     lastScanAt = Date.now();
     var changed = 0;
     try { changed += scanCards(force); } catch (e) { log('scanCards error', e); }
@@ -1459,17 +1682,39 @@
     var d = new Date(), p = function (n) { return String(n).padStart(2, '0'); };
     return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes());
   }
-  function exportJSON() {
-    var list = Object.keys(DB.assets).map(function (k) { return DB.assets[k]; })
+  function assetsForExport(ids) {
+    var wanted = null;
+    if (Array.isArray(ids)) {
+      wanted = {};
+      ids.forEach(function (id) { wanted[String(id)] = true; });
+    }
+    return Object.keys(DB.assets)
+      .filter(function (id) { return !wanted || wanted[id]; })
+      .map(function (id) { return DB.assets[id]; })
       .sort(function (a, b) { return Number(a.id) - Number(b.id); });
-    downloadFile('roblox-asset-tracker-' + stamp() + '.json',
-      JSON.stringify({ exportedAt: new Date().toISOString(), version: 1, counts: countByStatus(), assets: list }, null, 2));
-    toast('Exported ' + list.length + ' assets as JSON');
+  }
+  function countsForAssets(list) {
+    var c = { all: 0, approved: 0, pending: 0, moderated: 0, unknown: 0 };
+    (list || []).forEach(function (a) {
+      c.all++;
+      var s = a.status || 'unknown';
+      if (c[s] === undefined) c[s] = 0;
+      c[s]++;
+    });
+    return c;
+  }
+  function exportJSON(ids) {
+    var selectedOnly = Array.isArray(ids);
+    var list = assetsForExport(ids);
+    downloadFile('roblox-asset-tracker' + (selectedOnly ? '-selected' : '') + '-' + stamp() + '.json',
+      JSON.stringify({ exportedAt: new Date().toISOString(), version: 1, counts: countsForAssets(list), assets: list }, null, 2));
+    toast('Exported ' + list.length + (selectedOnly ? ' selected' : '') + ' assets as JSON');
+    return list.length;
   }
   function csvCell(v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; }
-  function exportCSV() {
-    var list = Object.keys(DB.assets).map(function (k) { return DB.assets[k]; })
-      .sort(function (a, b) { return Number(a.id) - Number(b.id); });
+  function exportCSV(ids) {
+    var selectedOnly = Array.isArray(ids);
+    var list = assetsForExport(ids);
     var rows = [['id', 'name', 'type', 'status', 'rawStatus', 'description', 'thumbnail', 'url', 'creator', 'created', 'firstSeen', 'lastSeen', 'lastChecked', 'lastStatusChange'].join(',')];
     list.forEach(function (a) {
       rows.push([a.id, a.name, a.type, a.status, a.rawStatus, a.description, a.thumbnail, openUrl(a), a.creatorName,
@@ -1477,8 +1722,9 @@
         new Date(a.lastSeen).toISOString(), a.lastChecked ? new Date(a.lastChecked).toISOString() : '',
         a.lastStatusChange ? new Date(a.lastStatusChange).toISOString() : ''].map(csvCell).join(','));
     });
-    downloadFile('roblox-asset-tracker-' + stamp() + '.csv', rows.join('\r\n'), 'text/csv');
-    toast('Exported ' + list.length + ' assets as CSV');
+    downloadFile('roblox-asset-tracker' + (selectedOnly ? '-selected' : '') + '-' + stamp() + '.csv', rows.join('\r\n'), 'text/csv');
+    toast('Exported ' + list.length + (selectedOnly ? ' selected' : '') + ' assets as CSV');
+    return list.length;
   }
   var htmlExportRunning = false;
 
@@ -1513,17 +1759,17 @@
       '</div></article>';
   }
 
-  function buildHTMLReport(thumbnailOverrides) {
+  function buildHTMLReport(thumbnailOverrides, ids) {
     var categories = [
       { key: 'approved', title: '✔ Approved' },
       { key: 'pending', title: '⏳ Pending' },
       { key: 'moderated', title: '⛔ Moderated' },
       { key: 'unknown', title: '? Unknown' }
     ];
-    var all = Object.keys(DB.assets).map(function (k) { return DB.assets[k]; });
+    var all = assetsForExport(ids);
     var sorter = (typeof SORTERS !== 'undefined' && SORTERS[settings.sortBy]) || function (a, b) { return Number(a.id) - Number(b.id); };
     all.sort(sorter);
-    var counts = countByStatus();
+    var counts = countsForAssets(all);
     var css = [
       ':root{color-scheme:dark;--bg:#11141a;--panel:#1b202a;--card:#222936;--line:#354052;--text:#f3f6fa;--muted:#a9b5c5;--blue:#00a2ff}',
       '*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:"Segoe UI",system-ui,-apple-system,Arial,sans-serif}',
@@ -1562,7 +1808,7 @@
     return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
       '<title>Roblox Creator Asset Tracker Report</title><style>' + css + '</style></head><body>' +
       '<header><h1>🗂️ Roblox Creator Asset Tracker Report</h1>' +
-      '<div class="muted">Generated ' + esc(fmtDate(Date.now())) + ' · ' + counts.all + ' unique assets · ' +
+      '<div class="muted">Generated ' + esc(fmtDate(Date.now())) + ' · ' + counts.all + (Array.isArray(ids) ? ' selected' : ' unique') + ' assets · ' +
       counts.approved + ' approved · ' + counts.pending + ' pending · ' + counts.moderated + ' moderated · ' + counts.unknown + ' unknown</div>' +
       '<div class="muted">Grouped by moderation category. Within each category, assets use the tracker\'s currently selected sort order. ' +
       (embeddedCount ? embeddedCount + ' thumbnail(s) are embedded directly in this HTML file; any remaining thumbnails load from Roblox\'s CDN.' : 'Thumbnails load from Roblox\'s CDN, so an internet connection is required for images.') + '</div>' +
@@ -1628,10 +1874,11 @@
     return blob ? blobToDataUrl(blob) : '';
   }
 
-  async function exportHTML() {
+  async function exportHTML(ids) {
     if (htmlExportRunning) { toast('An HTML export is already being prepared…'); return; }
-    var ids = Object.keys(DB.assets);
-    if (!ids.length) { toast('No assets to export yet.'); return; }
+    var selectedOnly = Array.isArray(ids);
+    ids = assetsForExport(ids).map(function (a) { return a.id; });
+    if (!ids.length) { toast(selectedOnly ? 'No selected assets to export.' : 'No assets to export yet.'); return; }
     htmlExportRunning = true;
     htmlExportProgress = 'Preparing HTML export…';
     updateStatusBar();
@@ -1680,8 +1927,8 @@
 
       htmlExportProgress = 'HTML export: building report…';
       updateStatusBar();
-      downloadFile('roblox-asset-tracker-report-' + stamp() + '.html', buildHTMLReport(overrides), 'text/html;charset=utf-8');
-      toast('Exported categorized HTML report with ' + ids.length + ' assets' +
+      downloadFile('roblox-asset-tracker-report' + (selectedOnly ? '-selected' : '') + '-' + stamp() + '.html', buildHTMLReport(overrides, selectedOnly ? ids : undefined), 'text/html;charset=utf-8');
+      toast('Exported categorized HTML report with ' + ids.length + (selectedOnly ? ' selected' : '') + ' assets' +
         (embeddedUrls ? ' (' + embeddedUrls + ' thumbnail image(s) embedded; others use Roblox CDN fallback)' : ''));
     } catch (e) {
       log('HTML export failed', e);
@@ -1791,6 +2038,8 @@
     '#panel.fullpage header{padding-left:max(14px,calc((100vw - 1560px)/2));padding-right:max(14px,calc((100vw - 1560px)/2))}',
     '#panel.fullpage .tabs{padding-left:max(14px,calc((100vw - 1560px)/2));padding-right:max(14px,calc((100vw - 1560px)/2))}',
     '#panel.fullpage .controls{padding-left:max(14px,calc((100vw - 1560px)/2));padding-right:max(14px,calc((100vw - 1560px)/2))}',
+    '#panel.fullpage .bulkbar{padding-left:max(14px,calc((100vw - 1560px)/2));padding-right:max(14px,calc((100vw - 1560px)/2))}',
+    '#panel.fullpage .loadmorebar{padding-left:max(14px,calc((100vw - 1560px)/2));padding-right:max(14px,calc((100vw - 1560px)/2))}',
     '#panel.fullpage #settings{padding-left:max(14px,calc((100vw - 1560px)/2));padding-right:max(14px,calc((100vw - 1560px)/2))}',
     '#panel.fullpage #list{padding:14px max(14px,calc((100vw - 1560px)/2))}',
     '#panel.fullpage #list.grid{grid-template-columns:repeat(auto-fill,minmax(275px,1fr));gap:14px}',
@@ -1816,6 +2065,10 @@
     '.tab.t-pending.on{background:#3d2f10;border-color:#f5b041}',
     '.tab.t-moderated.on{background:#3d1616;border-color:#e74c3c}',
     '.controls{display:flex;gap:6px;padding:10px 14px;flex-wrap:wrap;align-items:center;border-bottom:1px solid #343b4a}',
+    '.bulkbar{display:flex;gap:6px;padding:8px 14px;flex-wrap:wrap;align-items:center;background:#172a3a;border-bottom:1px solid #24587a;color:#e8f6ff;font-size:12.5px}',
+    '.bulkbar[hidden]{display:none}',
+    '.bulkbar .bulkcount{font-weight:800;color:#8fd8ff;margin-right:2px}',
+    '.bulkbar .btn,.bulkbar .sel{padding:6px 8px;font-size:12px}',
     '#settings{display:none;background:#20242d;border-bottom:1px solid #343b4a;padding:10px 14px;font-size:12.5px}',
     '#settings.open{display:block}',
     '#settings label{display:inline-flex;gap:6px;align-items:center;margin:4px 12px 4px 0;cursor:pointer}',
@@ -1825,6 +2078,12 @@
     '#list.rows{display:flex;flex-direction:column;gap:8px}',
     '.card{background:#242833;border:1px solid #343b4a;border-radius:10px;overflow:hidden;display:flex;flex-direction:column;min-width:0;min-height:0;height:max-content}',
     '.card.changed{outline:2px solid #00a2ff}',
+    '.card.selected{outline:3px solid #8fd8ff;outline-offset:-3px;border-color:#8fd8ff}',
+    '.cardtop{display:flex;align-items:center;gap:7px;min-width:0}',
+    '.cardtop .aname{flex:1 1 auto;min-width:0}',
+    '.selectwrap{display:inline-flex;align-items:center;gap:4px;flex:none;background:#171a20;border:1px solid #46536a;border-radius:999px;padding:3px 7px 3px 5px;color:#cfeaff;font-size:10.5px;font-weight:700;cursor:pointer;user-select:none}',
+    '.selectwrap:hover{border-color:#8fd8ff}',
+    '.asset-select{width:15px;height:15px;margin:0;accent-color:#00a2ff;cursor:pointer;flex:none}',
     '.thumbwrap{position:relative;background:#14161a;width:100%;height:auto;min-height:0;display:block;overflow:hidden;flex:0 0 auto;align-self:stretch}',
     '.thumbsizer{display:block;width:100%;height:0;padding-top:100%;pointer-events:none}',
     'button.thumbwrap{border:0;padding:0;margin:0;cursor:zoom-in;text-align:inherit;color:inherit;-webkit-appearance:none;appearance:none}',
@@ -1840,6 +2099,9 @@
     '.viewdetails{position:absolute;left:8px;bottom:8px;background:#00a2ffee;color:#fff;font-size:10px;font-weight:700;padding:3px 7px;border-radius:999px;opacity:0;transition:opacity .15s;pointer-events:none}',
     'button.thumbwrap:hover .viewdetails,button.thumbwrap:focus-visible .viewdetails{opacity:1}',
     '.loadmore{grid-column:1/-1;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;background:#20242d;border:1px solid #343b4a;border-radius:10px;padding:14px;color:#a7b0be;font-size:12.5px;width:100%}',
+    '.loadmorebar{display:flex;gap:7px;padding:8px 14px;flex-wrap:wrap;align-items:center;justify-content:center;background:#20242d;border-top:1px solid #343b4a;color:#c8d1dc;font-size:12.5px;flex:none}',
+    '.loadmorebar[hidden]{display:none}',
+    '.loadmorebar .btn{padding:6px 10px;font-size:12px}',
     '.badge{position:absolute;top:8px;left:8px;font-size:11px;font-weight:700;padding:3px 8px;border-radius:999px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.4)}',
     '.st-approved{background:#1e9e57}.st-pending{background:#d18d12}.st-moderated{background:#c0392b}.st-unknown{background:#5d6d7e}',
     '.st-pending.pulse{animation:pulse 1.6s ease-in-out infinite}',
@@ -1879,6 +2141,7 @@
     if (!els.sortSel) return;
     els.sortSel.value = settings.sortBy;
     if (els.setInterval) els.setInterval.value = String(settings.recheckMinutes);
+    if (els.setApprovedRefresh) els.setApprovedRefresh.value = String(settings.approvedRefreshHours);
     if (els.setAutoScan) els.setAutoScan.checked = !!settings.autoScan;
     if (els.setNotify) els.setNotify.checked = !!settings.notifyDesktop;
     if (els.setEnrich) els.setEnrich.checked = !!settings.enrichDescriptions;
@@ -1916,13 +2179,17 @@
             '<label>Auto re-check pending every <select class="sel" id="setInterval">' +
               '<option value="0">Off</option><option value="1">1 min</option><option value="2">2 min</option><option value="5">5 min</option><option value="10">10 min</option><option value="15">15 min</option><option value="30">30 min</option><option value="60">60 min</option>' +
             '</select></label>' +
-            '<label><input type="checkbox" id="setAutoScan"> Auto-scan pages as I browse</label>' +
+            '<label>Refresh approved every <select class="sel" id="setApprovedRefresh">' +
+              '<option value="0">Off</option><option value="6">6 hours</option><option value="12">12 hours</option><option value="24">24 hours</option><option value="72">3 days</option><option value="168">7 days</option>' +
+            '</select></label>' +
+            '<label><input type="checkbox" id="setAutoScan"> Auto-scan pages/dashboard data as I browse</label>' +
             '<label><input type="checkbox" id="setNotify"> Desktop notifications</label>' +
             '<label><input type="checkbox" id="setEnrich"> Fetch missing descriptions</label>' +
             '<label><input type="checkbox" id="setRecheckUnknown"> Also recheck “Unknown”</label>' +
             '<label><input type="checkbox" id="setIgnoreModerated"> Don’t log moderated assets</label>' +
             '<label><input type="checkbox" id="setHighResThumbnails"> Load high-resolution (420px) thumbnails</label>' +
             '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">' +
+              '<button class="btn" data-action="refresh-approved" title="Refresh the oldest-checked approved assets for status, name, and description changes">↻ Refresh approved now</button>' +
               '<button class="btn danger" data-action="purge-moderated" title="Remove only moderated assets and block their IDs from being logged again">⛔ Remove all moderated <span data-mod-count></span></button>' +
               '<button class="btn" data-action="reset-ignored" id="resetIgnoredBtn">Reset removed list</button>' +
               '<button class="btn danger" data-action="clear-db">🗑 Clear all tracked assets</button>' +
@@ -1930,6 +2197,9 @@
             '<div class="help">Assets are collected automatically from the dashboard\u2019s own data and from the cards on screen, then stored once per Asset ID in your browser. ' +
             'Pending assets are re-checked on the timer above (thumbnails state + asset details endpoints). Roblox has no public moderation-status API, so a status is a best-effort merge of those signals — hover a card\u2019s badge to see the raw status and its source. ' +
             'Removing a card also adds it to a “removed” list so it is not re-collected (reset it above to undo).<br><br>' +
+            '<b>Selection:</b> use each card’s Select checkbox (Shift-click selects a range), or the toolbar’s Select shown / Select filtered buttons. The blue bulk bar can recheck, copy, open, export, or remove all selected assets together.<br><br>' +
+            '<b>Approved refresh:</b> approved assets become stale after the interval above and are refreshed oldest-first in small batches during auto-recheck wakeups, including name/description changes.<br><br>' +
+            '<b>Auto-scan OFF</b> stops both page-card scanning and dashboard network-data collection while browsing. Manual Scan page and rechecks still work when you explicitly run them.<br><br>' +
             '<b>Live full-page view:</b> “⛶ Full page” opens this tracker in a new Creator Dashboard tab with #rcat-fullpage appended. It uses the same saved logs and keeps every live scan, recheck, details, settings, and export function; use “↘ Side panel” there to shrink it back into the side drawer.<br><br>' +
             '<b>Moderated assets:</b> “Remove all moderated” deletes only moderated records and blocks their IDs on the removed list, so rescanning cannot log them again. ' +
             'With “Don’t log moderated assets” ON, new moderated assets are skipped on sight, and a tracked asset that becomes moderated is removed right after its notification. ' +
@@ -1955,9 +2225,27 @@
             '<option value="checked-asc">Sort: Least recently checked</option>' +
           '</select>' +
           '<button class="btn" data-action="view" id="viewBtn" title="Toggle grid/list view">☰ List</button>' +
+          '<button class="btn" data-action="select-rendered" title="Select every asset currently rendered below">☑ Select shown</button>' +
+          '<button class="btn" data-action="select-filtered" title="Select every asset matching the current tab/search/type filters, including ones not rendered yet">☑ Select filtered</button>' +
           '<button class="btn danger" data-action="purge-moderated" id="purgeModBtn" style="display:none" title="Remove only moderated assets and block their IDs so they are not logged again">⛔ Remove moderated <span data-mod-count></span></button>' +
         '</div>' +
+        '<div class="bulkbar" id="bulkBar" hidden>' +
+          '<span class="bulkcount" id="bulkCount">0 selected</span>' +
+          '<button class="btn primary" data-action="bulk-recheck">↻ Recheck selected</button>' +
+          '<button class="btn" data-action="bulk-copy-ids">⧉ Copy IDs</button>' +
+          '<button class="btn" data-action="bulk-copy-rbx">⧉ Copy rbxassetids</button>' +
+          '<button class="btn" data-action="bulk-open">Open selected ↗</button>' +
+          '<button class="btn" data-action="bulk-details">Details</button>' +
+          '<select class="sel" id="bulkExportSel" title="Export only selected assets"><option value="">⬇ Export selected…</option><option value="json">JSON</option><option value="csv">CSV</option><option value="html">HTML report</option></select>' +
+          '<button class="btn danger" data-action="bulk-remove">Remove selected</button>' +
+          '<button class="btn" data-action="clear-selection">Clear selection</button>' +
+        '</div>' +
         '<div id="list"></div>' +
+        '<div class="loadmorebar" id="loadMoreBar" hidden>' +
+          '<span id="loadMoreText"></span>' +
+          '<button class="btn primary" id="loadMoreBtn" data-action="show-more">Load more</button>' +
+          '<button class="btn" data-action="show-all">Show all</button>' +
+        '</div>' +
         '<footer id="statusbar"></footer>' +
         '<input type="file" id="importFile" accept="application/json,.json" style="display:none">' +
       '</section>' +
@@ -1975,10 +2263,15 @@
       statusbar: shadow.getElementById('statusbar'), toasts: shadow.getElementById('toasts'),
       search: shadow.getElementById('searchInp'), typeSel: shadow.getElementById('typeSel'),
       sortSel: shadow.getElementById('sortSel'), exportSel: shadow.getElementById('exportSel'),
+      bulkBar: shadow.getElementById('bulkBar'), bulkCount: shadow.getElementById('bulkCount'),
+      bulkExportSel: shadow.getElementById('bulkExportSel'),
+      loadMoreBar: shadow.getElementById('loadMoreBar'), loadMoreText: shadow.getElementById('loadMoreText'),
+      loadMoreBtn: shadow.getElementById('loadMoreBtn'),
       fullPageBtn: shadow.getElementById('fullPageBtn'),
       settingsBox: shadow.getElementById('settings'), recheckBtn: shadow.getElementById('recheckBtn'),
       viewBtn: shadow.getElementById('viewBtn'), importFile: shadow.getElementById('importFile'),
-      setInterval: shadow.getElementById('setInterval'), setAutoScan: shadow.getElementById('setAutoScan'),
+      setInterval: shadow.getElementById('setInterval'), setApprovedRefresh: shadow.getElementById('setApprovedRefresh'),
+      setAutoScan: shadow.getElementById('setAutoScan'),
       setNotify: shadow.getElementById('setNotify'), setEnrich: shadow.getElementById('setEnrich'),
       setRecheckUnknown: shadow.getElementById('setRecheckUnknown'), resetIgnoredBtn: shadow.getElementById('resetIgnoredBtn'),
       setIgnoreModerated: shadow.getElementById('setIgnoreModerated'),
@@ -1990,6 +2283,7 @@
     // restore control state
     els.sortSel.value = settings.sortBy;
     els.setInterval.value = String(settings.recheckMinutes);
+    els.setApprovedRefresh.value = String(settings.approvedRefreshHours);
     els.setAutoScan.checked = !!settings.autoScan;
     els.setNotify.checked = !!settings.notifyDesktop;
     els.setEnrich.checked = !!settings.enrichDescriptions;
@@ -2001,7 +2295,9 @@
     applyPanelClass();
 
     els.fab.addEventListener('click', function () { togglePanel(); });
+    shadow.addEventListener('click', onSelectionClick, true);
     shadow.addEventListener('click', onPanelClick);
+    shadow.addEventListener('change', onPanelChange);
     els.search.addEventListener('input', debounce(function () { ui.search = els.search.value; ui.renderLimit = CONFIG.renderBatchSize; renderList(); }, 180));
     els.typeSel.addEventListener('change', function () { ui.typeFilter = els.typeSel.value; ui.renderLimit = CONFIG.renderBatchSize; renderList(); });
     els.sortSel.addEventListener('change', function () { settings.sortBy = els.sortSel.value; saveSettings(); ui.renderLimit = CONFIG.renderBatchSize; renderList(); });
@@ -2015,6 +2311,14 @@
         copyText(ids.join('\n'), 'Copied ' + ids.length + ' filtered asset ID(s)');
       } else if (v === 'import') els.importFile.click();
     });
+    els.bulkExportSel.addEventListener('change', function () {
+      var v = els.bulkExportSel.value; els.bulkExportSel.value = '';
+      var ids = selectedAssetIds();
+      if (!ids.length) { toast('No assets are selected.'); return; }
+      if (v === 'json') exportJSON(ids);
+      else if (v === 'csv') exportCSV(ids);
+      else if (v === 'html') exportHTML(ids);
+    });
     els.importFile.addEventListener('change', function () {
       var f = els.importFile.files && els.importFile.files[0];
       if (!f) return;
@@ -2025,7 +2329,21 @@
       settings.recheckMinutes = Number(els.setInterval.value) || 0; saveSettings(); scheduleRecheck();
       toast(settings.recheckMinutes ? ('Pending assets will auto re-check every ' + settings.recheckMinutes + ' min') : 'Auto re-check turned off');
     });
-    els.setAutoScan.addEventListener('change', function () { settings.autoScan = els.setAutoScan.checked; saveSettings(); });
+    els.setApprovedRefresh.addEventListener('change', function () {
+      settings.approvedRefreshHours = Number(els.setApprovedRefresh.value) || 0;
+      saveSettings(); scheduleRecheck();
+      toast(settings.approvedRefreshHours
+        ? ('Approved assets will be refreshed after ' + settings.approvedRefreshHours + ' hour(s), oldest-checked first.')
+        : 'Automatic approved-asset refresh turned off.');
+    });
+    els.setAutoScan.addEventListener('change', function () {
+      settings.autoScan = els.setAutoScan.checked;
+      saveSettings();
+      toast(settings.autoScan
+        ? 'Auto-scan ON — pages and dashboard data will be collected as you browse.'
+        : 'Auto-scan OFF — browsing will not collect assets automatically. Manual “Scan page” still works.');
+      if (settings.autoScan) setTimeout(function () { scanPage('auto'); }, 60);
+    });
     els.setNotify.addEventListener('change', function () { settings.notifyDesktop = els.setNotify.checked; saveSettings(); });
     els.setEnrich.addEventListener('change', function () {
       settings.enrichDescriptions = els.setEnrich.checked; saveSettings();
@@ -2070,6 +2388,147 @@
     setInterval(function () { updateStatusBar(); }, 1000);
   }
 
+  function syncSelectionUI() {
+    pruneSelection();
+    var n = ui.selectedIds.size;
+    if (els.bulkBar) els.bulkBar.hidden = n === 0;
+    if (els.bulkCount) els.bulkCount.textContent = n + ' selected';
+    if (!shadow) return;
+    var boxes = shadow.querySelectorAll('.asset-select');
+    boxes.forEach(function (input) {
+      var id = input.getAttribute('data-select-id') || '';
+      var on = ui.selectedIds.has(id);
+      input.checked = on;
+      var card = input.closest ? input.closest('.card') : null;
+      if (card) card.classList.toggle('selected', on);
+    });
+  }
+
+  function renderedAssetIds() {
+    if (shadow) {
+      return [].slice.call(shadow.querySelectorAll('.asset-select')).map(function (input) {
+        return input.getAttribute('data-select-id') || '';
+      }).filter(Boolean);
+    }
+    return (ui.lastRenderedIds || []).slice();
+  }
+
+  function selectRenderedAssets() {
+    var ids = renderedAssetIds();
+    pruneSelection();
+    ids.forEach(function (id) { if (DB.assets[id]) ui.selectedIds.add(id); });
+    if (ids.length) ui.lastSelectedId = ids[ids.length - 1];
+    syncSelectionUI();
+    toast(ids.length ? ('Selected ' + ids.length + ' shown asset(s).') : 'No rendered assets to select.');
+    return ids.length;
+  }
+
+  function selectFilteredAssets() {
+    var assets = visibleAssets();
+    pruneSelection();
+    assets.forEach(function (a) { ui.selectedIds.add(String(a.id)); });
+    if (assets.length) ui.lastSelectedId = String(assets[assets.length - 1].id);
+    syncSelectionUI();
+    toast(assets.length
+      ? ('Selected ' + assets.length + ' filtered asset(s)' + (assets.length > renderedAssetIds().length ? ' — including assets not rendered yet.' : '.'))
+      : 'No assets match the current filters.');
+    return assets.length;
+  }
+
+  function onPanelChange(e) {
+    var input = e.target && e.target.closest ? e.target.closest('.asset-select') : null;
+    if (!input) return;
+    setAssetSelected(input.getAttribute('data-select-id') || '', !!input.checked);
+  }
+
+  function onSelectionClick(e) {
+    var input = e.target && e.target.closest ? e.target.closest('.asset-select') : null;
+    if (!input || !e.shiftKey || !ui.lastSelectedId) return;
+    var ids = renderedAssetIds();
+    var currentId = input.getAttribute('data-select-id') || '';
+    var a = ids.indexOf(String(ui.lastSelectedId));
+    var b = ids.indexOf(currentId);
+    if (a === -1 || b === -1) return;
+    e.stopPropagation();
+    var shouldSelect = !ui.selectedIds.has(currentId);
+    ids.slice(Math.min(a, b), Math.max(a, b) + 1).forEach(function (id) {
+      if (shouldSelect) ui.selectedIds.add(id);
+      else ui.selectedIds.delete(id);
+    });
+    ui.lastSelectedId = currentId;
+    syncSelectionUI();
+    // Checkbox activation can toggle/revert the endpoint after this capturing
+    // handler runs. A deferred sync makes the visible boxes match the
+    // authoritative selection set in real browsers as well as jsdom.
+    setTimeout(syncSelectionUI, 0);
+  }
+
+  function openSelectedAssets() {
+    var ids = selectedAssetIds();
+    if (!ids.length) { toast('No assets are selected.'); return 0; }
+    if (ids.length > CONFIG.bulkOpenLimit) {
+      toast('For safety, bulk Open is capped at ' + CONFIG.bulkOpenLimit + ' tabs. Select a smaller group or use Copy IDs.');
+      return 0;
+    }
+    if (ids.length > 1 && !window.confirm('Open ' + ids.length + ' selected assets in separate tabs?')) return 0;
+    var opened = 0;
+    ids.forEach(function (id, index) {
+      var a = DB.assets[id]; if (!a) return;
+      var url = openUrl(a);
+      var ok = false;
+      try {
+        if (typeof GM_openInTab === 'function') {
+          ok = GM_openInTab(url, { active: index === 0, insert: true, setParent: true }) !== false;
+        } else if (typeof GM !== 'undefined' && GM && typeof GM.openInTab === 'function') {
+          GM.openInTab(url, { active: index === 0, insert: true, setParent: true });
+          ok = true;
+        }
+      } catch (e) { ok = false; }
+      if (!ok) {
+        try { ok = !!window.open(url, '_blank'); } catch (e) { ok = false; }
+      }
+      if (ok) opened++;
+    });
+    toast(opened ? ('Opened ' + opened + ' selected asset tab(s).') : 'The browser blocked opening the selected asset tabs.');
+    return opened;
+  }
+
+  function showSelectedDetails() {
+    var ids = selectedAssetIds();
+    if (ids.length === 1) { openAssetDetails(ids[0]); return true; }
+    toast(ids.length ? 'Details can display one asset at a time — leave exactly one asset selected.' : 'No assets are selected.');
+    return false;
+  }
+
+  function showMoreAssets() {
+    var before = els.list ? els.list.querySelectorAll('.card').length : 0;
+    ui.renderLimit = Math.max(CONFIG.renderBatchSize, Number(ui.renderLimit) || CONFIG.renderBatchSize) + CONFIG.renderBatchSize;
+    renderList();
+    var cards = els.list ? els.list.querySelectorAll('.card') : [];
+    var firstNew = cards[before];
+    if (firstNew && typeof firstNew.scrollIntoView === 'function') {
+      // Use an instant jump: the first new card can be more than 100 cards
+      // below the old viewport, so a smooth animation is slow/dizzying and
+      // may not have reached the continuation point when the user resumes.
+      try { firstNew.scrollIntoView({ block: 'start', behavior: 'auto' }); } catch (e) {}
+    }
+    return Math.max(0, cards.length - before);
+  }
+
+  function updateLoadMoreBar(total, shown) {
+    if (!els.loadMoreBar) return;
+    total = Math.max(0, Number(total) || 0);
+    shown = Math.max(0, Math.min(total, Number(shown) || 0));
+    var remaining = total - shown;
+    els.loadMoreBar.hidden = remaining <= 0;
+    if (els.loadMoreText) {
+      els.loadMoreText.textContent = 'Showing ' + shown + ' of ' + total + ' filtered assets · ' + remaining + ' not rendered yet';
+    }
+    if (els.loadMoreBtn) {
+      els.loadMoreBtn.textContent = 'Load ' + Math.min(CONFIG.renderBatchSize, Math.max(remaining, 0)) + ' more';
+    }
+  }
+
   function onPanelClick(e) {
     var desc = e.target && e.target.closest ? e.target.closest('.adesc') : null;
     var btn = e.target && e.target.closest ? e.target.closest('[data-action],[data-tab]') : null;
@@ -2087,12 +2546,41 @@
       case 'close': togglePanel(false); break;
       case 'close-details': closeAssetDetails(); break;
       case 'show-details': if (id) openAssetDetails(id); break;
-      case 'show-more': ui.renderLimit += CONFIG.renderBatchSize; renderList(); break;
+      case 'show-more': showMoreAssets(); break;
       case 'show-all': ui.renderLimit = Number.MAX_SAFE_INTEGER; renderList(); break;
+      case 'select-rendered': selectRenderedAssets(); break;
+      case 'select-filtered': selectFilteredAssets(); break;
+      case 'clear-selection': clearSelection(); break;
+      case 'bulk-recheck': {
+        var bulkRecheckIds = selectedAssetIds();
+        if (bulkRecheckIds.length) recheckAssets(bulkRecheckIds, 'manual-bulk', { refreshMetadata: true });
+        else toast('No assets are selected.');
+        break;
+      }
+      case 'bulk-copy-ids': {
+        var bulkIds = selectedAssetIds();
+        if (bulkIds.length) copyText(bulkIds.join('\n'), 'Copied ' + bulkIds.length + ' selected asset ID(s)');
+        else toast('No assets are selected.');
+        break;
+      }
+      case 'bulk-copy-rbx': {
+        var bulkRbxIds = selectedAssetIds();
+        if (bulkRbxIds.length) {
+          copyText(bulkRbxIds.map(function (x) { return 'rbxassetid://' + x; }).join('\n'),
+            'Copied ' + bulkRbxIds.length + ' selected rbxassetid value(s)');
+        } else toast('No assets are selected.');
+        break;
+      }
+      case 'bulk-open': openSelectedAssets(); break;
+      case 'bulk-details': showSelectedDetails(); break;
+      case 'bulk-remove': removeSelectedAssetsWithConfirm(); break;
+      case 'refresh-approved':
+        refreshApprovedAssets('approved-manual', { manual: true, forceBatch: true, limit: 100, announce: true });
+        break;
       case 'purge-moderated': purgeModeratedWithConfirm(); break;
       case 'scan': lastScanSignature = ''; scanPage('manual', true); renderAll(); break;
       case 'recheck-all': recheckPending('manual'); break;
-      case 'recheck-one': if (id) recheckAssets([id], 'manual-one'); break;
+      case 'recheck-one': if (id) recheckAssets([id], 'manual-one', { refreshMetadata: true }); break;
       case 'toggle-settings': ui.settingsOpen = !ui.settingsOpen; els.settingsBox.className = ui.settingsOpen ? 'open' : ''; break;
       case 'view':
         settings.view = settings.view === 'rows' ? 'grid' : 'rows'; saveSettings();
@@ -2104,6 +2592,7 @@
         if (id && DB.assets[id]) {
           var nm = DB.assets[id].name || id;
           delete DB.assets[id]; blockAsset(id, 'removed-manual');
+          if (ui.selectedIds) ui.selectedIds.delete(String(id));
           if (String(ui.detailsId || '') === String(id)) closeAssetDetails();
           saveDBNow(); renderAll();
           toast('Removed "' + nm + '" and added it to the removed list (Settings can reset it).');
@@ -2117,7 +2606,10 @@
         break;
       case 'clear-db':
         if (window.confirm('Delete ALL tracked assets from the tracker database?\nThis cannot be undone (your Roblox assets are not affected).')) {
-          DB.assets = {}; closeAssetDetails(); saveDBNow(); renderAll();
+          DB.assets = {};
+          if (ui.selectedIds) ui.selectedIds.clear();
+          ui.lastSelectedId = '';
+          closeAssetDetails(); saveDBNow(); renderAll();
           toast('Tracker database cleared.');
         }
         break;
@@ -2392,6 +2884,7 @@
         detailMetaHTML('First seen', fmtDate(a.firstSeen)) +
         detailMetaHTML('Last seen', fmtDate(a.lastSeen)) +
         detailMetaHTML('Last checked', a.lastChecked ? fmtDate(a.lastChecked) : 'Never') +
+        detailMetaHTML('Status last observed', a.statusObservedAt ? fmtDate(a.statusObservedAt) : '') +
         detailMetaHTML('Status changed', a.lastStatusChange ? fmtDate(a.lastStatusChange) : '') +
         detailMetaHTML('Raw status', a.rawStatus || '') +
         detailMetaHTML('Status source', a.statusSource || '') +
@@ -2445,7 +2938,8 @@
     } else {
       thumbImg = '<span class="thumbplaceholder">🖼️</span>';
     }
-    return '<article class="card' + (a.unseenChange ? ' changed' : '') + '">' +
+    var isSelected = !!(ui.selectedIds && ui.selectedIds.has(String(a.id)));
+    return '<article class="card' + (a.unseenChange ? ' changed' : '') + (isSelected ? ' selected' : '') + '">' +
       '<button type="button" class="thumbwrap" data-action="show-details" data-id="' + esc(a.id) + '" title="View details for ' + esc(a.name || ('Asset ' + a.id)) + '" aria-label="View details for ' + esc(a.name || ('Asset ' + a.id)) + '">' +
         '<span class="thumbsizer" aria-hidden="true"></span>' +
         thumbImg +
@@ -2456,7 +2950,12 @@
         (a.unseenChange ? '<span class="newtag">CHANGED</span>' : '') +
       '</button>' +
       '<div class="cbody">' +
-        '<div class="aname" title="' + esc(a.name || '') + '">' + esc(a.name || ('Asset ' + a.id)) + '</div>' +
+        '<div class="cardtop">' +
+          '<label class="selectwrap" title="Select this asset for bulk actions (Shift-click selects a range)">' +
+            '<input type="checkbox" class="asset-select" data-select-id="' + esc(a.id) + '"' + (isSelected ? ' checked' : '') +
+              ' aria-label="Select ' + esc(a.name || ('Asset ' + a.id)) + ' for bulk actions">Select</label>' +
+          '<div class="aname" title="' + esc(a.name || '') + '">' + esc(a.name || ('Asset ' + a.id)) + '</div>' +
+        '</div>' +
         '<div class="ameta"><code class="id" title="Asset ID">' + esc(a.id) + '</code>' +
           '<button class="btn" data-action="copy-id" data-id="' + esc(a.id) + '" title="Copy ID">⧉ ID</button>' +
           (a.type ? '<span class="chip">' + esc(a.type) + '</span>' : '') +
@@ -2520,28 +3019,38 @@
 
   function renderList() {
     if (!els.list) return;
+    pruneSelection();
     var list = visibleAssets();
     if (!Object.keys(DB.assets).length) {
+      ui.lastRenderedIds = [];
       els.list.innerHTML = '<div class="empty">No assets tracked yet.<br><br>Open <b>Creations → Development Items</b> (Decals, Images, Audio, Models…) or your <b>Marketplace / Avatar Items</b> in the Creator Dashboard and page or scroll through them — every asset you view is collected here automatically, once per Asset ID.<br><br>You can also press <b>🔍 Scan page</b> at any time.</div>';
       setupThumbnailLoader();
+      updateLoadMoreBar(0, 0);
+      syncSelectionUI();
       return;
     }
     if (!list.length) {
+      ui.lastRenderedIds = [];
       els.list.innerHTML = '<div class="empty">No assets match the current tab / search / type filter.</div>';
       setupThumbnailLoader();
+      updateLoadMoreBar(0, 0);
+      syncSelectionUI();
       return;
     }
     var limit = Math.max(CONFIG.renderBatchSize, Number(ui.renderLimit) || CONFIG.renderBatchSize);
     var shown = list.slice(0, limit);
+    ui.lastRenderedIds = shown.map(function (a) { return String(a.id); });
     var html = shown.map(cardHTML).join('');
     if (list.length > shown.length) {
       var remaining = list.length - shown.length;
       html += '<div class="loadmore"><span>Showing ' + shown.length + ' of ' + list.length + ' assets · ' + remaining + ' more are kept out of the DOM for faster thumbnail loading.</span>' +
-        '<button class="btn primary" data-action="show-more">Show ' + Math.min(CONFIG.renderBatchSize, remaining) + ' more</button>' +
+        '<button class="btn primary" data-action="show-more">Load ' + Math.min(CONFIG.renderBatchSize, remaining) + ' more</button>' +
         '<button class="btn" data-action="show-all">Show all</button></div>';
     }
     els.list.innerHTML = html;
     setupThumbnailLoader();
+    updateLoadMoreBar(list.length, shown.length);
+    syncSelectionUI();
     // Upgrade only what is actually rendered, in background batches of 20.
     queueHighResThumbnails(shown);
     if (ui.detailsId) refreshOpenAssetDetails();
@@ -2560,14 +3069,15 @@
   function updateStatusBar() {
     if (!els.statusbar) return;
     var parts = [];
+    parts.push('Auto-scan: ' + (settings.autoScan ? 'on' : 'OFF'));
     parts.push('Last scan: ' + (lastScanAt ? timeAgo(lastScanAt) : '—'));
     parts.push('Last recheck: ' + (lastRecheckAt ? timeAgo(lastRecheckAt) : '—'));
     if (htmlExportRunning) parts.push('⬇ ' + (htmlExportProgress || 'Preparing HTML export…'));
     if (recheckRunning) parts.push('⏳ ' + (recheckProgress || 'Rechecking…'));
     else if (nextRecheckAt) {
       var s = Math.max(0, Math.round((nextRecheckAt - Date.now()) / 1000));
-      parts.push('Next pending recheck in ' + Math.floor(s / 60) + 'm ' + (s % 60) + 's');
-    } else parts.push('Auto recheck: off');
+      parts.push('Next automatic refresh in ' + Math.floor(s / 60) + 'm ' + (s % 60) + 's');
+    } else parts.push('Auto recheck/refresh: off');
     els.statusbar.innerHTML = parts.map(function (p) { return '<span>' + esc(p) + '</span>'; }).join('');
   }
 
@@ -2619,6 +3129,10 @@
       GM_registerMenuCommand('Asset Tracker: Open live full-page tracker', function () { buildUI(); openFullPageTracker(); });
       GM_registerMenuCommand('Asset Tracker: Scan this page', function () { lastScanSignature = ''; scanPage('manual', true); });
       GM_registerMenuCommand('Asset Tracker: Recheck pending now', function () { recheckPending('manual'); });
+      GM_registerMenuCommand('Asset Tracker: Refresh approved assets now', function () {
+        refreshApprovedAssets('approved-menu', { manual: true, forceBatch: true, limit: 100, announce: true });
+      });
+      GM_registerMenuCommand('Asset Tracker: Load more assets', function () { buildUI(); togglePanel(true); showMoreAssets(); });
       GM_registerMenuCommand('Asset Tracker: Remove all moderated assets', function () { purgeModeratedWithConfirm(); });
       GM_registerMenuCommand('Asset Tracker: Export JSON', function () { exportJSON(); });
       GM_registerMenuCommand('Asset Tracker: Export HTML report', function () { exportHTML(); });
@@ -2646,16 +3160,38 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
-  /* Debug/testing handle  */
+  /* Debug/testing handle (also handy in DevTools: __RCAT__.scanPage('manual', true)) */
   try {
     var api = {
-      version: '1.3.0',
+      version: '1.4.0',
       get db() { return DB; },
       settings: settings,
       ui: ui,
       scanPage: scanPage,
       recheckPending: recheckPending,
       recheckAssets: recheckAssets,
+      approvedIdsOldestFirst: approvedIdsOldestFirst,
+      staleApprovedIds: staleApprovedIds,
+      refreshApprovedAssets: refreshApprovedAssets,
+      selectedAssetIds: selectedAssetIds,
+      setAssetSelected: setAssetSelected,
+      clearSelection: clearSelection,
+      selectRenderedAssets: function () { buildUI(); return selectRenderedAssets(); },
+      selectFilteredAssets: function () { buildUI(); return selectFilteredAssets(); },
+      renderedAssetIds: renderedAssetIds,
+      removeAssetsByIds: removeAssetsByIds,
+      removeSelectedAssetsWithConfirm: removeSelectedAssetsWithConfirm,
+      openSelectedAssets: openSelectedAssets,
+      showSelectedDetails: showSelectedDetails,
+      showMoreAssets: function () { buildUI(); return showMoreAssets(); },
+      updateLoadMoreBar: updateLoadMoreBar,
+      assetsForExport: assetsForExport,
+      exportJSON: exportJSON,
+      exportCSV: exportCSV,
+      exportHTML: exportHTML,
+      statusFromBadgeText: statusFromBadgeText,
+      scanStatusIn: scanStatusIn,
+      currentDetailAssetId: currentDetailAssetId,
       upsertAsset: upsertAsset,
       harvestFromJSON: harvestFromJSON,
       extractAssetRecord: extractAssetRecord,
@@ -2665,7 +3201,6 @@
       purgeModeratedWithConfirm: purgeModeratedWithConfirm,
       blockedModeratedCount: blockedModeratedCount,
       buildHTMLReport: buildHTMLReport,
-      exportHTML: exportHTML,
       openAssetDetails: openAssetDetails,
       closeAssetDetails: closeAssetDetails,
       needsHighResThumbnail: needsHighResThumbnail,
