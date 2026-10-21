@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Roblox Creator Asset Tracker
-// @namespace   https://www.github.com/annaroblox
-// @version      1.2.0
-// @description  Collects every asset you view on the Roblox Creator Dashboard, keeps ONE deduped record per Asset ID (name, description, thumbnail, type), sorts assets into Approved / Pending / Moderated, lets you search, sort, inspect, multi-select and bulk-manage assets, periodically re-checks pending assets and refreshes approved metadata/status, can purge or skip moderated assets without relogging them, exports JSON, CSV, or a categorized HTML report, and can open as a live full-page tracker linked to the same logs.
+// @namespace    https://www.github.com/annaroblox
+// @version      1.3.0
+// @description  Collects every asset you view on the Roblox Creator Dashboard, keeps ONE deduped record per Asset ID (name, description, thumbnail, type), sorts assets into Approved / Pending / Moderated, lets you search, sort, inspect, multi-select and bulk-manage assets, manually add pure Asset ID/link lists by paste or file and check/categorize them, periodically re-checks pending assets and refreshes approved metadata/status, can purge or skip moderated assets without relogging them, exports JSON, CSV, or a categorized HTML report, and can open as a live full-page tracker linked to the same logs.
 // @author       annaroblox
 // @match        https://create.roblox.com/*
 // @match        https://www.roblox.com/develop*
@@ -27,6 +27,7 @@
 // @noframes
 // @license      Apache
 // ==/UserScript==
+
 (function () {
   'use strict';
 
@@ -52,6 +53,8 @@
     approvedRefreshBatchSize: 30,   // stale approved assets refreshed per auto wakeup
     approvedRefreshWakeMinutes: 60, // wake cadence when pending auto-recheck is Off
     bulkOpenLimit: 10,              // avoid accidental tab floods from bulk Open
+    manualAddLimit: 5000,           // unique IDs accepted from one manual paste/file
+    manualAddFileMaxBytes: 5242880, // 5 MiB list-file safety cap
     maxHistoryEntries: 25,
     defaultRecheckMinutes: 5,
     defaultApprovedRefreshHours: 24
@@ -90,7 +93,7 @@
     70: 'Left Shoe Accessory', 71: 'Right Shoe Accessory', 72: 'Dress/Skirt Accessory'
   };
 
-  /* URL path segment -> asset type */
+  /* URL path segment -> asset type  */
   var TYPE_BY_SEGMENT = {
     'decals': 'Decal', 'decal': 'Decal', 'images': 'Image', 'image': 'Image',
     'audio': 'Audio', 'sounds': 'Audio', 'sound': 'Audio', 'videos': 'Video', 'video': 'Video',
@@ -191,7 +194,7 @@
   var ui = {
     tab: 'all', search: '', typeFilter: '', panelOpen: false, settingsOpen: false,
     renderLimit: CONFIG.renderBatchSize, detailsId: '', fullPage: false,
-    selectedIds: new Set(), lastSelectedId: '', lastRenderedIds: []
+    selectedIds: new Set(), lastSelectedId: '', lastRenderedIds: [], manualAddOpen: false
   };
   var lastScanAt = 0, lastRecheckAt = 0, nextRecheckAt = 0;
   var recheckRunning = false, recheckProgress = '';
@@ -1097,7 +1100,7 @@
       var id = String((item && typeof item === 'object') ? item.id : item);
       var a = DB.assets[id];
       // A failed/missing thumbnail is retried at most once every 10 minutes,
-      // preventing a render loop
+      // preventing a render -> retry -> render loop.
       if (!a || highResQueued[id] || (highResAttemptedAt[id] && now - highResAttemptedAt[id] < 600000) || !needsHighResThumbnail(a)) return;
       highResQueued[id] = true;
       highResAttemptedAt[id] = now;
@@ -1388,7 +1391,7 @@
     afterDBChange();
   }
 
-  /* ============================== DOM scanning ) ============================== */
+  /* ============================== DOM scanning patterns) ============================== */
   function typeFromPath(path) {
     var segs = String(path || '').toLowerCase().split('/').filter(Boolean);
     for (var i = segs.length - 1; i >= 0; i--) if (TYPE_BY_SEGMENT[segs[i]]) return TYPE_BY_SEGMENT[segs[i]];
@@ -1960,6 +1963,502 @@
     toast('Imported/updated ' + n + ' asset(s) from ' + list.length + ' records.');
   }
 
+  /* ============================== manual ID/link add ============================== */
+  function normalizeManualAssetId(value) {
+    if (typeof value === 'number') {
+      if (!isFinite(value) || Math.floor(value) !== value || value <= 0) return '';
+      value = String(value);
+    }
+    var s = String(value == null ? '' : value).trim();
+    if (!/^\d+$/.test(s)) return '';
+    s = s.replace(/^0+(?=\d)/, '');
+    return (s.length >= 4 && s.length <= 20 && !/^0+$/.test(s)) ? s : '';
+  }
+
+  function cleanManualToken(token) {
+    var s = String(token == null ? '' : token).trim().replace(/&amp;/gi, '&');
+    try { if (/%3a%2f%2f/i.test(s)) s = decodeURIComponent(s); } catch (e) {}
+    s = s.replace(/^[{\[(<"'`]+/, '').replace(/[}\])>"'`]+$/, '');
+    s = s.replace(/[.,;:]+$/, '');
+    s = s.replace(/^[{\[(<"'`]+/, '').replace(/[}\])>"'`]+$/, '');
+    return s.trim();
+  }
+
+  function extractManualAssetFromLink(raw) {
+    var original = cleanManualToken(raw);
+    if (!original) return null;
+    var rbx = original.match(/rbxassetid:\/\/(\d{1,20})/i);
+    if (rbx) {
+      var rbxId = normalizeManualAssetId(rbx[1]);
+      return rbxId ? { id: rbxId, url: '', type: '', kind: 'rbxassetid', sourceText: original } : null;
+    }
+
+    var href = original;
+    if (/^www\./i.test(href)) href = 'https://' + href;
+    else if (/^(create|www|apis|assetdelivery|economy|thumbnails|itemconfiguration)\.roblox\.com\//i.test(href)) href = 'https://' + href;
+    else if (/^roblox\.com\//i.test(href)) href = 'https://www.' + href;
+
+    var u;
+    try { u = new URL(href, location.origin); } catch (e) { return null; }
+    var host = String(u.hostname || '').toLowerCase();
+    var isPathOnly = original.charAt(0) === '/';
+    if (!isPathOnly && host !== 'roblox.com' && !/\.roblox\.com$/.test(host)) return null;
+
+    var path = u.pathname || '';
+    try {
+      var existing = extractIdFromHref(u.href);
+      if (existing) {
+        var existingId = normalizeManualAssetId(existing.id);
+        if (existingId) {
+          return {
+            id: existingId, url: u.href, type: existing.hintType || typeFromPath(path),
+            kind: 'link', sourceText: original
+          };
+        }
+      }
+    } catch (e) {}
+
+    var segs = path.split('/').filter(Boolean).map(function (seg) {
+      try { return decodeURIComponent(seg); } catch (e) { return seg; }
+    });
+    var lower = segs.map(function (seg) { return String(seg).toLowerCase(); });
+    var badSegments = {
+      users: 1, user: 1, profile: 1, groups: 1, group: 1, communities: 1,
+      friends: 1, docs: 1, learn: 1, settings: 1, account: 1,
+      notifications: 1, search: 1, home: 1
+    };
+    if (lower.some(function (seg) { return !!badSegments[seg]; })) return null;
+
+    var queryId = '';
+    try {
+      var wanted = { assetid: 1, itemid: 1, targetid: 1, asset_id: 1, item_id: 1 };
+      u.searchParams.forEach(function (val, key) {
+        if (!queryId && wanted[String(key).toLowerCase()]) queryId = normalizeManualAssetId(val);
+      });
+      if (!queryId) {
+        var genericId = u.searchParams.get('id');
+        if (genericId && /(asset|catalog|library|item|store|creations|marketplace|configure|avatar|assetdelivery)/i.test(path + ' ' + host)) {
+          queryId = normalizeManualAssetId(genericId);
+        }
+      }
+    } catch (e) {}
+    if (queryId) {
+      return { id: queryId, url: u.href, type: typeFromPath(path), kind: 'link', sourceText: original };
+    }
+
+    var assetSegments = {
+      asset: 1, assets: 1, catalog: 1, library: 1, item: 1, items: 1,
+      place: 1, places: 1, game: 1, games: 1
+    };
+    for (var i = 0; i < lower.length - 1; i++) {
+      var nextId = normalizeManualAssetId(segs[i + 1]);
+      if (!nextId) continue;
+      if (assetSegments[lower[i]] || TYPE_BY_SEGMENT[lower[i]]) {
+        return {
+          id: nextId, url: u.href,
+          type: (lower[i] === 'game' || lower[i] === 'games' || lower[i] === 'place' || lower[i] === 'places')
+            ? 'Place' : (TYPE_BY_SEGMENT[lower[i]] || typeFromPath(path)),
+          kind: 'link', sourceText: original
+        };
+      }
+    }
+
+    if (/(dashboard|creations|marketplace|avatar-items|development-items|configure|store|catalog|library|asset|item)/i.test(path)) {
+      for (var j = segs.length - 1; j >= 0; j--) {
+        var segId = normalizeManualAssetId(segs[j]);
+        if (segId && !/^v\d+$/i.test(segs[j - 1] || '')) {
+          return { id: segId, url: u.href, type: typeFromPath(path), kind: 'link', sourceText: original };
+        }
+      }
+    }
+    return null;
+  }
+
+  function manualEntryFromToken(token) {
+    var s = cleanManualToken(token);
+    if (!s) return null;
+    var pureId = normalizeManualAssetId(s);
+    if (pureId) return { id: pureId, url: '', type: '', kind: 'id', sourceText: s };
+
+    var rbx = s.match(/rbxassetid:\/\/(\d{1,20})/i);
+    if (rbx) {
+      var rbxId = normalizeManualAssetId(rbx[1]);
+      return rbxId ? { id: rbxId, url: '', type: '', kind: 'rbxassetid', sourceText: s } : null;
+    }
+
+    var labelled = s.match(/^(?:asset\s*id|item\s*id|assetid|itemid|targetid|asset_id|item_id|id)\s*[:=#-]?\s*(\d{1,20})$/i);
+    if (labelled) {
+      var labelledId = normalizeManualAssetId(labelled[1]);
+      return labelledId ? { id: labelledId, url: '', type: '', kind: 'id', sourceText: s } : null;
+    }
+
+    if (/^(https?:)?\/\//i.test(s) || /^www\./i.test(s) || /(^|\.)roblox\.com\//i.test(s) || s.charAt(0) === '/' || /\//.test(s)) {
+      return extractManualAssetFromLink(s);
+    }
+    return null;
+  }
+
+  function createManualParseState() {
+    return {
+      entries: [], byId: {}, candidateCount: 0, duplicateCount: 0,
+      invalidCount: 0, invalidExamples: [], inputTruncated: false
+    };
+  }
+
+  function addManualParsedEntry(state, entry, raw) {
+    state.candidateCount++;
+    var id = entry ? normalizeManualAssetId(entry.id) : '';
+    if (!id) {
+      state.invalidCount++;
+      if (state.invalidExamples.length < 8 && raw != null && String(raw).trim()) {
+        state.invalidExamples.push(String(raw).slice(0, 120));
+      }
+      return false;
+    }
+    var existing = state.byId[id];
+    if (existing) {
+      state.duplicateCount++;
+      if (!existing.url && entry.url) existing.url = String(entry.url);
+      if (!existing.type && entry.type) existing.type = String(entry.type);
+      if (existing.kind === 'id' && entry.kind && entry.kind !== 'id') existing.kind = String(entry.kind);
+      return false;
+    }
+    var clean = {
+      id: id,
+      url: entry.url ? String(entry.url) : '',
+      type: entry.type ? String(entry.type) : '',
+      kind: entry.kind ? String(entry.kind) : 'id',
+      sourceText: entry.sourceText ? String(entry.sourceText) : String(raw == null ? id : raw)
+    };
+    state.byId[id] = clean;
+    state.entries.push(clean);
+    return true;
+  }
+
+  function addManualCandidate(state, raw) {
+    return addManualParsedEntry(state, manualEntryFromToken(raw), raw);
+  }
+
+  function finishManualParse(state, format) {
+    var entries = state.entries.map(function (e) { return Object.assign({}, e); });
+    return {
+      entries: entries,
+      ids: entries.map(function (e) { return e.id; }),
+      candidateCount: state.candidateCount,
+      duplicateCount: state.duplicateCount,
+      invalidCount: state.invalidCount,
+      invalidExamples: state.invalidExamples.slice(),
+      inputTruncated: !!state.inputTruncated,
+      format: format || 'text'
+    };
+  }
+
+  function manualJSONKey(key) {
+    return String(key || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  }
+
+  function collectManualJSONValue(value, state, depth) {
+    if (depth > 12 || value == null) return;
+    if (typeof value === 'number' || typeof value === 'string') {
+      addManualCandidate(state, value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(function (item) { collectManualJSONValue(item, state, depth + 1); });
+      return;
+    }
+    if (typeof value !== 'object') return;
+
+    var keyMap = {};
+    Object.keys(value).forEach(function (k) { keyMap[manualJSONKey(k)] = value[k]; });
+
+    if (keyMap.assets !== undefined) {
+      var assetsValue = keyMap.assets;
+      if (Array.isArray(assetsValue)) {
+        collectManualJSONValue(assetsValue, state, depth + 1);
+      } else if (assetsValue && typeof assetsValue === 'object') {
+        Object.keys(assetsValue).forEach(function (k) {
+          var rec = assetsValue[k];
+          if (rec && typeof rec === 'object' && !Array.isArray(rec)) {
+            var before = state.candidateCount;
+            collectManualJSONValue(rec, state, depth + 1);
+            if (state.candidateCount === before) addManualCandidate(state, k);
+          } else addManualCandidate(state, k);
+        });
+      }
+      return;
+    }
+
+    var idVal;
+    ['assetid', 'itemid', 'targetid', 'id'].forEach(function (k) {
+      if (idVal === undefined && keyMap[k] !== undefined) idVal = keyMap[k];
+    });
+    var urlVal;
+    ['pageurl', 'asseturl', 'url', 'link', 'href'].forEach(function (k) {
+      if (urlVal === undefined && typeof keyMap[k] === 'string') urlVal = keyMap[k];
+    });
+    if (idVal !== undefined || urlVal !== undefined) {
+      var fromUrl = urlVal ? manualEntryFromToken(urlVal) : null;
+      var jsonId = normalizeManualAssetId(idVal) || (fromUrl ? fromUrl.id : '');
+      var typeVal = keyMap.type || keyMap.assettype || keyMap.assettypename || '';
+      addManualParsedEntry(state, jsonId ? {
+        id: jsonId,
+        url: urlVal || (fromUrl ? fromUrl.url : ''),
+        type: typeVal ? prettyType(typeVal) : (fromUrl ? fromUrl.type : ''),
+        kind: urlVal ? 'link' : 'id',
+        sourceText: urlVal || jsonId
+      } : null, urlVal !== undefined ? urlVal : idVal);
+      return;
+    }
+
+    var objectKeys = Object.keys(value);
+    var idKeys = objectKeys.filter(function (k) { return !!normalizeManualAssetId(k); });
+    if (idKeys.length && idKeys.length >= Math.ceil(objectKeys.length / 2)) {
+      idKeys.forEach(function (k) { addManualCandidate(state, k); });
+      return;
+    }
+
+    var foundList = false;
+    ['ids', 'assetids', 'itemids', 'links', 'urls', 'data', 'items', 'results', 'records'].forEach(function (k) {
+      if (keyMap[k] !== undefined) {
+        foundList = true;
+        collectManualJSONValue(keyMap[k], state, depth + 1);
+      }
+    });
+    if (foundList) return;
+
+    objectKeys.forEach(function (k) {
+      var nk = manualJSONKey(k);
+      if (['creator', 'owner', 'user', 'group', 'counts', 'count'].indexOf(nk) !== -1) return;
+      var child = value[k];
+      if (child && typeof child === 'object') collectManualJSONValue(child, state, depth + 1);
+    });
+  }
+
+  function parseDelimitedRows(text, delimiter) {
+    var rows = [], row = [], field = '', inQuotes = false;
+    function endField() { row.push(field); field = ''; }
+    function endRow() {
+      endField();
+      if (row.some(function (cell) { return String(cell).trim() !== ''; })) rows.push(row);
+      row = [];
+    }
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (inQuotes) {
+        if (ch === '"') {
+          if (text.charAt(i + 1) === '"') { field += '"'; i++; }
+          else inQuotes = false;
+        } else field += ch;
+      } else if (ch === '"' && field === '') {
+        inQuotes = true;
+      } else if (ch === delimiter) {
+        endField();
+      } else if (ch === '\n') {
+        endRow();
+      } else if (ch !== '\r') {
+        field += ch;
+      }
+    }
+    if (field !== '' || row.length) endRow();
+    return rows;
+  }
+
+  function manualEntriesFromDelimitedTable(text, state) {
+    var firstLine = '';
+    String(text).split(/\r?\n/).some(function (line) {
+      if (String(line).trim()) { firstLine = String(line); return true; }
+      return false;
+    });
+    if (!firstLine) return false;
+    var delimiter = firstLine.indexOf('\t') !== -1 ? '\t' :
+      ((firstLine.split(';').length > firstLine.split(',').length) ? ';' : ',');
+    if (firstLine.indexOf(delimiter) === -1) return false;
+    var rows = parseDelimitedRows(String(text), delimiter);
+    if (rows.length < 2) return false;
+    var headers = rows[0].map(manualJSONKey);
+    function findHeader(names) {
+      for (var i = 0; i < headers.length; i++) if (names.indexOf(headers[i]) !== -1) return i;
+      return -1;
+    }
+    var idIdx = findHeader(['id', 'assetid', 'itemid', 'targetid']);
+    var urlIdx = findHeader(['url', 'link', 'href', 'pageurl', 'asseturl']);
+    if (idIdx === -1 && urlIdx === -1) return false;
+    rows.slice(1).forEach(function (row) {
+      var rawId = idIdx >= 0 ? row[idIdx] : '';
+      var rawUrl = urlIdx >= 0 ? row[urlIdx] : '';
+      var entry = manualEntryFromToken(rawId) || manualEntryFromToken(rawUrl);
+      addManualParsedEntry(state, entry, rawId || rawUrl);
+    });
+    return true;
+  }
+
+  function parseManualTextList(text, state) {
+    String(text).split(/\r?\n/).forEach(function (rawLine) {
+      var line = String(rawLine || '').trim();
+      if (!line) return;
+      if (/^(?:asset\s*id|item\s*id|assetid|itemid|assetids|id|links?|urls?)\s*:?$/i.test(line)) return;
+
+      var urlPattern = /(?:rbxassetid:\/\/\d{1,20}|https?:\/\/[^\s<>"',;]+|www\.[^\s<>"',;]+|(?:create|www|assetdelivery)\.roblox\.com\/[^\s<>"',;]+)/gi;
+      var urls = line.match(urlPattern) || [];
+      urls.forEach(function (u) { addManualCandidate(state, u); });
+      urlPattern.lastIndex = 0;
+      var rest = line.replace(urlPattern, ' ');
+
+      var labelledPattern = /(?:asset\s*id|item\s*id|assetid|itemid|targetid|asset_id|item_id)\s*[:=#-]?\s*(\d{1,20})/gi;
+      rest = rest.replace(labelledPattern, function (_m, id) {
+        addManualCandidate(state, id);
+        return ' ';
+      });
+
+      rest.split(/[\s,;|]+/).forEach(function (tok) {
+        if (tok) addManualCandidate(state, tok);
+      });
+    });
+  }
+
+  function parseManualAssetEntries(input, options) {
+    options = options || {};
+    var state = createManualParseState();
+
+    if (Array.isArray(input)) {
+      input.forEach(function (item) {
+        if (item && typeof item === 'object') collectManualJSONValue(item, state, 0);
+        else if (typeof item === 'string' && /[\r\n,;]/.test(item)) parseManualTextList(item, state);
+        else addManualCandidate(state, item);
+      });
+      return finishManualParse(state, 'array');
+    }
+    if (input && typeof input === 'object') {
+      collectManualJSONValue(input, state, 0);
+      return finishManualParse(state, 'json');
+    }
+
+    var text = input == null ? '' : String(input);
+    var maxChars = Number(options.maxChars) || CONFIG.manualAddFileMaxBytes || 5242880;
+    if (maxChars > 0 && text.length > maxChars) {
+      text = text.slice(0, maxChars);
+      state.inputTruncated = true;
+    }
+
+    var trimmed = text.trim();
+    if (trimmed.charAt(0) === '{' || trimmed.charAt(0) === '[') {
+      try {
+        collectManualJSONValue(JSON.parse(trimmed), state, 0);
+        return finishManualParse(state, 'json');
+      } catch (e) {
+        // A bracketed hand-written list can still be parsed as text below.
+      }
+    }
+    if (manualEntriesFromDelimitedTable(text, state)) return finishManualParse(state, 'delimited');
+    parseManualTextList(text, state);
+    return finishManualParse(state, 'text');
+  }
+
+  function manualAddSummaryText(result) {
+    if (!result) return 'No assets were added.';
+    var bits = [];
+    if (result.newIds && result.newIds.length) bits.push('Added ' + result.newIds.length + ' new');
+    if (result.existingIds && result.existingIds.length) bits.push(result.existingIds.length + ' already tracked');
+    if (result.checkedCount) bits.push('checked ' + result.checkedCount);
+    if (result.checkedCount && result.categoryCounts) {
+      var cats = [];
+      if (result.categoryCounts.approved) cats.push(result.categoryCounts.approved + ' approved');
+      if (result.categoryCounts.pending) cats.push(result.categoryCounts.pending + ' pending');
+      if (result.categoryCounts.moderated) cats.push(result.categoryCounts.moderated + ' moderated');
+      if (result.categoryCounts.unknown) cats.push(result.categoryCounts.unknown + ' unknown');
+      if (cats.length) bits.push('Categories: ' + cats.join(', '));
+    }
+    if (result.removedDuringCheckIds && result.removedDuringCheckIds.length) {
+      bits.push(result.removedDuringCheckIds.length + ' removed by “Don’t log moderated assets”');
+    }
+    if (result.blockedIds && result.blockedIds.length) bits.push('skipped ' + result.blockedIds.length + ' on removed list');
+    if (result.unblockedIds && result.unblockedIds.length) bits.push('re-added ' + result.unblockedIds.length + ' from removed list');
+    if (result.parsed && result.parsed.duplicateCount) bits.push(result.parsed.duplicateCount + ' duplicate(s) ignored');
+    if (result.parsed && result.parsed.invalidCount) bits.push(result.parsed.invalidCount + ' unrecognized entr' + (result.parsed.invalidCount === 1 ? 'y' : 'ies'));
+    if (result.truncatedCount) bits.push(result.truncatedCount + ' beyond the per-add limit were not processed');
+    if (result.parsed && result.parsed.inputTruncated) bits.push('input was truncated at the safety limit');
+    return bits.length ? bits.join(' · ') + '.' : 'No recognized asset IDs or Roblox asset links were found.';
+  }
+
+  async function addManualAssets(input, options) {
+    options = options || {};
+    var parsed = parseManualAssetEntries(input, options);
+    var limit = Number(options.limit) || CONFIG.manualAddLimit || 5000;
+    if (!(limit > 0)) limit = CONFIG.manualAddLimit || 5000;
+    var entries = parsed.entries.slice(0, limit);
+    var result = {
+      parsed: parsed,
+      parsedUniqueCount: parsed.entries.length,
+      truncatedCount: Math.max(0, parsed.entries.length - entries.length),
+      acceptedIds: [], newIds: [], existingIds: [], blockedIds: [],
+      unblockedIds: [], skippedIds: [], checkedCount: 0,
+      stillTrackedIds: [], removedDuringCheckIds: [],
+      categoryCounts: { all: 0, approved: 0, pending: 0, moderated: 0, unknown: 0 }
+    };
+    result.counts = result.categoryCounts;
+
+    if (!entries.length) {
+      if (options.announce !== false) toast('No recognized asset IDs or Roblox asset links were found.');
+      result.summary = manualAddSummaryText(result);
+      return result;
+    }
+
+    entries.forEach(function (entry) {
+      var id = String(entry.id);
+      if (DB.ignored[id]) {
+        if (options.includeBlocked) {
+          delete DB.ignored[id];
+          result.unblockedIds.push(id);
+        } else {
+          result.blockedIds.push(id);
+          return;
+        }
+      }
+      var before = DB.assets[id];
+      var existed = !!before;
+      upsertAsset({
+        id: id,
+        url: entry.url || '',
+        type: (before && before.type) ? '' : (entry.type || '')
+      }, options.source || 'manual:add');
+      if (DB.assets[id]) {
+        result.acceptedIds.push(id);
+        if (existed) result.existingIds.push(id);
+        else result.newIds.push(id);
+      } else {
+        result.skippedIds.push(id);
+      }
+    });
+
+    saveDBNow();
+    renderAll();
+
+    if (options.selectAdded && result.acceptedIds.length) {
+      pruneSelection();
+      result.acceptedIds.forEach(function (id) { ui.selectedIds.add(String(id)); });
+      ui.lastSelectedId = result.acceptedIds[result.acceptedIds.length - 1];
+      syncSelectionUI();
+    }
+
+    if (options.check !== false && result.acceptedIds.length) {
+      while (recheckRunning) await sleep(300);
+      result.checkedCount = await recheckAssets(result.acceptedIds.slice(), options.reason || 'manual-add', {
+        refreshMetadata: true,
+        quiet: !!options.quietRecheck
+      });
+    }
+
+    result.stillTrackedIds = result.acceptedIds.filter(function (id) { return !!DB.assets[id]; });
+    result.removedDuringCheckIds = result.acceptedIds.filter(function (id) { return !DB.assets[id]; });
+    result.categoryCounts = countsForAssets(assetsForExport(result.stillTrackedIds));
+    result.counts = result.categoryCounts;
+    result.summary = manualAddSummaryText(result);
+    if (options.announce !== false) toast(result.summary, 9000);
+    log('manual add:', result.summary, 'accepted:', result.acceptedIds.length, 'checked:', result.checkedCount);
+    return result;
+  }
+
   async function copyText(t, label) {
     var done = false;
     try { await navigator.clipboard.writeText(t); done = true; } catch (e) {}
@@ -2134,7 +2633,18 @@
     '.detailsMeta{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:7px;margin:10px 0}.metaItem{background:#171a20;border:1px solid #343b4a;border-radius:8px;padding:7px 9px;min-width:0}.metaItem span{display:block;color:#8fa0b4;font-size:10px;text-transform:uppercase;letter-spacing:.05em}.metaItem b{font-size:12px;overflow-wrap:anywhere}',
     '.history{font-size:12px;color:#bac7d6;line-height:1.5;background:#171a20;border:1px solid #343b4a;border-radius:9px;padding:9px 10px}.history h3{margin:0 0 5px;font-size:12px;color:#fff}.history ul{margin:0;padding-left:18px}',
     '.detailsActions{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}.detailsActions .btn{text-decoration:none}',
-    '@media(max-width:720px){.detailsGrid{grid-template-columns:1fr}.detailsCard{padding:12px}.detailsHead h2{font-size:17px}}'
+    '.manualCard{width:min(780px,96vw);max-height:92dvh;overflow:auto;background:#20242d;color:#f2f4f5;border:1px solid #46536a;border-radius:14px;box-shadow:0 24px 70px rgba(0,0,0,.65);padding:16px}',
+    '.manualCard.dragover{border-color:#00a2ff;box-shadow:0 0 0 3px rgba(0,162,255,.35),0 24px 70px rgba(0,0,0,.65)}',
+    '.manualHead{display:flex;gap:10px;align-items:flex-start;margin-bottom:8px}.manualHead h2{font-size:19px;line-height:1.3;margin:0;flex:1}',
+    '.manualHelp{color:#a7b0be;font-size:12.5px;line-height:1.55;margin:6px 0 10px}.manualHelp code{background:#171a20;color:#9fd8ff;padding:1px 5px;border-radius:4px}',
+    '.manualLabel{display:block;font-size:12px;font-weight:700;color:#dbe3ec;margin:8px 0 5px}',
+    '.manualInput{width:100%;min-height:190px;resize:vertical;background:#0d1015;color:#f2f4f5;border:1px solid #3d4657;border-radius:9px;padding:10px;font:12.5px/1.5 ui-monospace,Consolas,monospace;outline:none}',
+    '.manualInput:focus{border-color:#00a2ff;box-shadow:0 0 0 2px rgba(0,162,255,.22)}.manualInput:disabled{opacity:.65;cursor:wait}',
+    '.manualMeta{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:7px;color:#a7b0be;font-size:12px}.manualMeta .fileName{color:#8fd8ff;overflow-wrap:anywhere}',
+    '.manualOptions{display:flex;gap:7px 14px;flex-wrap:wrap;margin:11px 0;color:#dbe3ec;font-size:12.5px}.manualOptions label{display:inline-flex;gap:6px;align-items:center;cursor:pointer}.manualOptions input{accent-color:#00a2ff;width:15px;height:15px}',
+    '.manualActions{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:10px}.manualActions .sp{flex:1}',
+    '.manualStatus{margin-top:10px;background:#171a20;border:1px solid #343b4a;border-radius:8px;padding:8px 10px;color:#bac7d6;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}.manualStatus:empty{display:none}',
+    '@media(max-width:720px){.detailsGrid{grid-template-columns:1fr}.detailsCard,.manualCard{padding:12px}.detailsHead h2,.manualHead h2{font-size:17px}.manualInput{min-height:160px}}'
   ].join('\n');
 
   function syncSettingsControls() {
@@ -2168,6 +2678,7 @@
         '<header>' +
           '<div class="hrow"><h1>🗂️ Creator Asset Tracker</h1><span class="sp"></span>' +
             '<button class="btn" data-action="scan">🔍 Scan page</button>' +
+            '<button class="btn" data-action="open-manual-add" title="Manually add pure Asset IDs or Roblox asset links by pasting a list or choosing a list file">＋ Add IDs/links</button>' +
             '<button class="btn primary" id="recheckBtn" data-action="recheck-all">↻ Recheck pending</button>' +
             '<select class="sel" id="exportSel" title="Export"><option value="">⬇ Export…</option><option value="json">JSON</option><option value="csv">CSV</option><option value="html">HTML report (categories + thumbnails)</option><option value="copyids">Copy filtered IDs</option><option value="import">Import JSON…</option></select>' +
             '<button class="btn" id="fullPageBtn" data-action="open-fullpage" title="Open the live Asset Tracker as a full page in a new tab (same saved logs and controls)">⛶ Full page</button>' +
@@ -2198,6 +2709,7 @@
             'Pending assets are re-checked on the timer above (thumbnails state + asset details endpoints). Roblox has no public moderation-status API, so a status is a best-effort merge of those signals — hover a card\u2019s badge to see the raw status and its source. ' +
             'Removing a card also adds it to a “removed” list so it is not re-collected (reset it above to undo).<br><br>' +
             '<b>Selection:</b> use each card’s Select checkbox (Shift-click selects a range), or the toolbar’s Select shown / Select filtered buttons. The blue bulk bar can recheck, copy, open, export, or remove all selected assets together.<br><br>' +
+            '<b>Manual add:</b> “＋ Add IDs/links” accepts a pasted list or a .txt/.csv/.json file of pure Asset IDs, rbxassetid values, or Roblox asset/configure links. It dedupes the list and, with “Check and categorize now” enabled, checks each accepted asset for status, name, description, type, dates, and thumbnail.<br><br>' +
             '<b>Approved refresh:</b> approved assets become stale after the interval above and are refreshed oldest-first in small batches during auto-recheck wakeups, including name/description changes.<br><br>' +
             '<b>Auto-scan OFF</b> stops both page-card scanning and dashboard network-data collection while browsing. Manual Scan page and rechecks still work when you explicitly run them.<br><br>' +
             '<b>Live full-page view:</b> “⛶ Full page” opens this tracker in a new Creator Dashboard tab with #rcat-fullpage appended. It uses the same saved logs and keeps every live scan, recheck, details, settings, and export function; use “↘ Side panel” there to shrink it back into the side drawer.<br><br>' +
@@ -2248,9 +2760,33 @@
         '</div>' +
         '<footer id="statusbar"></footer>' +
         '<input type="file" id="importFile" accept="application/json,.json" style="display:none">' +
+        '<input type="file" id="manualAddFile" accept=".txt,.text,.csv,.tsv,.json,.md,text/plain,text/csv,text/tab-separated-values,application/json" style="display:none">' +
       '</section>' +
       '<div id="detailsOverlay" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Asset details">' +
         '<div class="detailsCard"><div id="detailsContent"></div></div>' +
+      '</div>' +
+      '<div id="manualAddOverlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="manualAddTitle">' +
+        '<div class="manualCard" id="manualAddCard">' +
+          '<div class="manualHead"><h2 id="manualAddTitle">＋ Add asset IDs or links</h2>' +
+            '<button class="btn" data-action="close-manual-add" title="Close">✕</button></div>' +
+          '<div class="manualHelp">Paste one entry per line, or separate entries with commas, semicolons, or spaces. Accepts pure IDs such as <code>123456789</code>, <code>rbxassetid://123456789</code>, Creator Dashboard configure links, and Roblox library/catalog/store links. You can also choose or drop a <b>.txt</b>, <b>.csv</b>, <b>.tsv</b>, <b>.json</b>, or <b>.md</b> list file. Duplicates are merged into the existing one-record-per-ID database.</div>' +
+          '<label class="manualLabel" for="manualAddInput">Asset IDs or links</label>' +
+          '<textarea class="manualInput" id="manualAddInput" spellcheck="false" placeholder="123456789&#10;987654321, 555555555&#10;rbxassetid://123456789&#10;https://create.roblox.com/dashboard/creations/decals/123456789/configure&#10;https://www.roblox.com/library/987654321/Asset-Name"></textarea>' +
+          '<div class="manualMeta"><span class="fileName" id="manualAddFileName"></span><span id="manualAddPreview">No IDs or links entered yet.</span></div>' +
+          '<div class="manualOptions">' +
+            '<label><input type="checkbox" id="manualAddCheck" checked> Check and categorize now</label>' +
+            '<label><input type="checkbox" id="manualAddBlocked"> Include IDs on removed list</label>' +
+            '<label><input type="checkbox" id="manualAddSelect" checked> Select accepted assets</label>' +
+          '</div>' +
+          '<div class="manualActions">' +
+            '<button class="btn" data-action="choose-manual-file">📁 Choose list file…</button>' +
+            '<button class="btn" data-action="clear-manual-add">Clear</button>' +
+            '<span class="sp"></span>' +
+            '<button class="btn" data-action="close-manual-add">Cancel</button>' +
+            '<button class="btn primary" id="manualAddSubmit" data-action="submit-manual-add" disabled>Add &amp; check</button>' +
+          '</div>' +
+          '<div class="manualStatus" id="manualAddStatus" aria-live="polite"></div>' +
+        '</div>' +
       '</div>' +
       '<div id="toasts"></div>';
     shadow.appendChild(wrap);
@@ -2277,7 +2813,13 @@
       setIgnoreModerated: shadow.getElementById('setIgnoreModerated'),
       setHighResThumbnails: shadow.getElementById('setHighResThumbnails'),
       purgeModBtn: shadow.getElementById('purgeModBtn'), modBlockInfo: shadow.getElementById('modBlockInfo'),
-      detailsOverlay: shadow.getElementById('detailsOverlay'), detailsContent: shadow.getElementById('detailsContent')
+      detailsOverlay: shadow.getElementById('detailsOverlay'), detailsContent: shadow.getElementById('detailsContent'),
+      manualAddOverlay: shadow.getElementById('manualAddOverlay'), manualAddCard: shadow.getElementById('manualAddCard'),
+      manualAddInput: shadow.getElementById('manualAddInput'), manualAddFileName: shadow.getElementById('manualAddFileName'),
+      manualAddPreview: shadow.getElementById('manualAddPreview'), manualAddStatus: shadow.getElementById('manualAddStatus'),
+      manualAddCheck: shadow.getElementById('manualAddCheck'), manualAddBlocked: shadow.getElementById('manualAddBlocked'),
+      manualAddSelect: shadow.getElementById('manualAddSelect'), manualAddSubmit: shadow.getElementById('manualAddSubmit'),
+      manualAddFile: shadow.getElementById('manualAddFile')
     };
 
     // restore control state
@@ -2324,6 +2866,41 @@
       if (!f) return;
       f.text().then(function (t) { importJSON(t); }).catch(function () { toast('Import failed: could not read file'); });
       els.importFile.value = '';
+    });
+    els.manualAddInput.addEventListener('input', debounce(updateManualAddPreview, 180));
+    els.manualAddCheck.addEventListener('change', updateManualAddPreview);
+    els.manualAddBlocked.addEventListener('change', updateManualAddPreview);
+    els.manualAddFile.addEventListener('change', function () {
+      var f = els.manualAddFile.files && els.manualAddFile.files[0];
+      els.manualAddFile.value = '';
+      if (f) loadManualAddFile(f);
+    });
+    els.manualAddOverlay.addEventListener('click', function (e) {
+      if (e.target === els.manualAddOverlay) closeManualAdd();
+    });
+    ['dragenter', 'dragover'].forEach(function (eventName) {
+      els.manualAddCard.addEventListener(eventName, function (e) {
+        e.preventDefault();
+        els.manualAddCard.classList.add('dragover');
+      });
+    });
+    els.manualAddCard.addEventListener('dragleave', function (e) {
+      if (e.target === els.manualAddCard) els.manualAddCard.classList.remove('dragover');
+    });
+    els.manualAddCard.addEventListener('drop', function (e) {
+      e.preventDefault();
+      els.manualAddCard.classList.remove('dragover');
+      var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) loadManualAddFile(f);
+      else if (e.dataTransfer && typeof e.dataTransfer.getData === 'function') {
+        var droppedText = e.dataTransfer.getData('text/plain') || e.dataTransfer.getData('text/uri-list') || '';
+        if (droppedText) {
+          els.manualAddInput.value = droppedText;
+          manualAddLoadedFileName = '';
+          if (els.manualAddFileName) els.manualAddFileName.textContent = '';
+          updateManualAddPreview();
+        }
+      }
     });
     els.setInterval.addEventListener('change', function () {
       settings.recheckMinutes = Number(els.setInterval.value) || 0; saveSettings(); scheduleRecheck();
@@ -2380,12 +2957,190 @@
     els.detailsOverlay.addEventListener('click', function (e) { if (e.target === els.detailsOverlay) closeAssetDetails(); });
     document.addEventListener('keydown', function (e) {
       if (e.key !== 'Escape') return;
-      if (ui.detailsId) closeAssetDetails();
+      if (ui.manualAddOpen) closeManualAdd();
+      else if (ui.detailsId) closeAssetDetails();
       else if (ui.panelOpen) togglePanel(false);
     });
 
     renderAll();
     setInterval(function () { updateStatusBar(); }, 1000);
+  }
+
+  var manualAddRunning = false;
+  var manualAddLoadedFileName = '';
+
+  function openManualAdd() {
+    if (!els.manualAddOverlay) return false;
+    if (ui.detailsId) closeAssetDetails();
+    ui.manualAddOpen = true;
+    els.manualAddOverlay.className = 'overlay';
+    els.manualAddOverlay.id = 'manualAddOverlay';
+    updateManualAddPreview();
+    setTimeout(function () {
+      try { if (els.manualAddInput) els.manualAddInput.focus(); } catch (e) {}
+    }, 30);
+    return true;
+  }
+
+  function closeManualAdd() {
+    ui.manualAddOpen = false;
+    if (els.manualAddOverlay) {
+      els.manualAddOverlay.className = 'overlay hidden';
+      els.manualAddOverlay.id = 'manualAddOverlay';
+    }
+    if (els.manualAddCard) els.manualAddCard.classList.remove('dragover');
+    return true;
+  }
+
+  function updateManualAddPreview() {
+    if (!els.manualAddInput || !els.manualAddPreview) return null;
+    var parsed = parseManualAssetEntries(els.manualAddInput.value || '');
+    var limit = CONFIG.manualAddLimit || 5000;
+    var shownEntries = parsed.entries.slice(0, limit);
+    var includeBlocked = !!(els.manualAddBlocked && els.manualAddBlocked.checked);
+    var existingCount = 0, blockedCount = 0, actionableCount = 0;
+    shownEntries.forEach(function (entry) {
+      if (DB.assets[entry.id]) existingCount++;
+      if (DB.ignored[entry.id]) blockedCount++;
+      if (!DB.ignored[entry.id] || includeBlocked) actionableCount++;
+    });
+
+    if (!parsed.entries.length && !parsed.invalidCount) {
+      els.manualAddPreview.textContent = 'No IDs or links entered yet.';
+    } else {
+      var bits = [parsed.entries.length + ' unique asset(s) recognized'];
+      if (parsed.duplicateCount) bits.push(parsed.duplicateCount + ' duplicate(s)');
+      if (parsed.invalidCount) bits.push(parsed.invalidCount + ' unrecognized');
+      if (existingCount) bits.push(existingCount + ' already tracked');
+      if (blockedCount) bits.push(blockedCount + (includeBlocked ? ' removed-list ID(s) will be re-added' : ' on removed list'));
+      if (parsed.entries.length > limit) bits.push('only the first ' + limit + ' will be processed');
+      if (parsed.inputTruncated) bits.push('input truncated at safety limit');
+      els.manualAddPreview.textContent = bits.join(' · ') + '.';
+    }
+    els.manualAddPreview.title = parsed.invalidExamples.length
+      ? ('Unrecognized examples: ' + parsed.invalidExamples.join(' | '))
+      : '';
+
+    if (els.manualAddSubmit) {
+      els.manualAddSubmit.disabled = manualAddRunning || actionableCount === 0;
+      els.manualAddSubmit.textContent = manualAddRunning
+        ? 'Working…'
+        : ((els.manualAddCheck && els.manualAddCheck.checked)
+          ? ('Add & check' + (actionableCount ? ' (' + actionableCount + ')' : ''))
+          : ('Add assets' + (actionableCount ? ' (' + actionableCount + ')' : '')));
+    }
+    return parsed;
+  }
+
+  function setManualAddRunning(on, statusText) {
+    manualAddRunning = !!on;
+    [els.manualAddInput, els.manualAddCheck, els.manualAddBlocked, els.manualAddSelect, els.manualAddFile].forEach(function (el) {
+      if (el) el.disabled = manualAddRunning;
+    });
+    if (shadow) {
+      shadow.querySelectorAll('[data-action="choose-manual-file"],[data-action="clear-manual-add"]').forEach(function (btn) {
+        btn.disabled = manualAddRunning;
+      });
+    }
+    if (els.manualAddStatus && statusText != null) els.manualAddStatus.textContent = statusText;
+    updateManualAddPreview();
+  }
+
+  function readManualTextFile(file) {
+    if (file && typeof file.text === 'function') return Promise.resolve(file.text());
+    return new Promise(function (resolve, reject) {
+      try {
+        var reader = new FileReader();
+        reader.onload = function () { resolve(String(reader.result || '')); };
+        reader.onerror = function () { reject(reader.error || new Error('Could not read file')); };
+        reader.readAsText(file);
+      } catch (e) { reject(e); }
+    });
+  }
+
+  async function loadManualAddFile(file) {
+    if (!file) return false;
+    buildUI();
+    if (Number(file.size) > (CONFIG.manualAddFileMaxBytes || 5242880)) {
+      toast('That list file is larger than the 5 MiB safety limit. Split it into smaller lists.');
+      if (els.manualAddStatus) els.manualAddStatus.textContent = 'List file was not loaded: it exceeds the 5 MiB safety limit.';
+      return false;
+    }
+    try {
+      var text = await readManualTextFile(file);
+      openManualAdd();
+      manualAddLoadedFileName = String(file.name || 'list file');
+      els.manualAddInput.value = String(text || '');
+      if (els.manualAddFileName) els.manualAddFileName.textContent = 'Loaded ' + manualAddLoadedFileName;
+      if (els.manualAddStatus) {
+        els.manualAddStatus.textContent = 'Loaded “' + manualAddLoadedFileName + '”. Review the preview, then choose Add & check.';
+      }
+      updateManualAddPreview();
+      return true;
+    } catch (e) {
+      log('manual list file load failed', e);
+      toast('Could not read that list file.');
+      if (els.manualAddStatus) els.manualAddStatus.textContent = 'Could not read that list file.';
+      return false;
+    }
+  }
+
+  async function submitManualAddFromUI() {
+    if (!els.manualAddInput || manualAddRunning) return null;
+    var parsed = updateManualAddPreview();
+    if (!parsed || !parsed.entries.length) {
+      if (els.manualAddStatus) els.manualAddStatus.textContent = 'No recognized asset IDs or Roblox asset links were found.';
+      toast('No recognized asset IDs or Roblox asset links were found.');
+      return null;
+    }
+
+    var checkNow = !!(els.manualAddCheck && els.manualAddCheck.checked);
+    var includeBlocked = !!(els.manualAddBlocked && els.manualAddBlocked.checked);
+    var limit = CONFIG.manualAddLimit || 5000;
+    var actionable = parsed.entries.slice(0, limit).filter(function (entry) {
+      return !DB.ignored[entry.id] || includeBlocked;
+    });
+    if (!actionable.length) {
+      if (els.manualAddStatus) {
+        els.manualAddStatus.textContent = 'Every recognized ID is on the removed list. Tick “Include IDs on removed list” if you want to add them again.';
+      }
+      return null;
+    }
+    if (checkNow && actionable.length > 500 && !window.confirm(
+      'Check ' + actionable.length + ' manually added assets now?\n\n' +
+      'The tracker will request thumbnails, asset details, names, and descriptions in controlled batches. ' +
+      'A very large list can take a while and may be rate-limited by Roblox.')) {
+      if (els.manualAddStatus) els.manualAddStatus.textContent = 'Manual add cancelled before checking the large list.';
+      return null;
+    }
+
+    setManualAddRunning(true, checkNow
+      ? ('Adding and checking ' + actionable.length + ' asset(s)… Progress is also shown in the tracker status bar.')
+      : ('Adding ' + actionable.length + ' asset(s)…'));
+    try {
+      var result = await addManualAssets(els.manualAddInput.value || '', {
+        check: checkNow,
+        includeBlocked: includeBlocked,
+        selectAdded: !!(els.manualAddSelect && els.manualAddSelect.checked),
+        announce: false,
+        sourceName: manualAddLoadedFileName
+      });
+      if (els.manualAddStatus) {
+        els.manualAddStatus.textContent = result.summary + (checkNow
+          ? ' Accepted assets were checked for status, name, description, type, dates, and thumbnails.'
+          : ' No full status check was run; use Recheck selected when you are ready to categorize them.');
+      }
+      toast(result.summary, 9000);
+      return result;
+    } catch (e) {
+      log('manual add failed', e);
+      if (els.manualAddStatus) els.manualAddStatus.textContent = 'Manual add failed. See the browser console / [RCAT] log for details.';
+      toast('Manual add failed — see console/[RCAT] debug log.');
+      return null;
+    } finally {
+      setManualAddRunning(false);
+      updateManualAddPreview();
+    }
   }
 
   function syncSelectionUI() {
@@ -2545,6 +3300,20 @@
         break;
       case 'close': togglePanel(false); break;
       case 'close-details': closeAssetDetails(); break;
+      case 'open-manual-add': openManualAdd(); break;
+      case 'close-manual-add': closeManualAdd(); break;
+      case 'choose-manual-file': if (els.manualAddFile) els.manualAddFile.click(); break;
+      case 'clear-manual-add':
+        if (!manualAddRunning && els.manualAddInput) {
+          els.manualAddInput.value = '';
+          manualAddLoadedFileName = '';
+          if (els.manualAddFileName) els.manualAddFileName.textContent = '';
+          if (els.manualAddStatus) els.manualAddStatus.textContent = '';
+          updateManualAddPreview();
+          els.manualAddInput.focus();
+        }
+        break;
+      case 'submit-manual-add': submitManualAddFromUI(); break;
       case 'show-details': if (id) openAssetDetails(id); break;
       case 'show-more': showMoreAssets(); break;
       case 'show-all': ui.renderLimit = Number.MAX_SAFE_INTEGER; renderList(); break;
@@ -2718,6 +3487,7 @@
 
   function togglePanel(force) {
     var nextOpen = (typeof force === 'boolean') ? force : !ui.panelOpen;
+    if (!nextOpen && ui.manualAddOpen) closeManualAdd();
     if (!nextOpen && ui.detailsId) closeAssetDetails();
     ui.panelOpen = nextOpen;
     applyPanelClass();
@@ -3023,7 +3793,7 @@
     var list = visibleAssets();
     if (!Object.keys(DB.assets).length) {
       ui.lastRenderedIds = [];
-      els.list.innerHTML = '<div class="empty">No assets tracked yet.<br><br>Open <b>Creations → Development Items</b> (Decals, Images, Audio, Models…) or your <b>Marketplace / Avatar Items</b> in the Creator Dashboard and page or scroll through them — every asset you view is collected here automatically, once per Asset ID.<br><br>You can also press <b>🔍 Scan page</b> at any time.</div>';
+      els.list.innerHTML = '<div class="empty">No assets tracked yet.<br><br>Open <b>Creations → Development Items</b> (Decals, Images, Audio, Models…) or your <b>Marketplace / Avatar Items</b> in the Creator Dashboard and page or scroll through them — every asset you view is collected here automatically, once per Asset ID.<br><br>You can also press <b>🔍 Scan page</b>, or use <b>＋ Add IDs/links</b> to paste/upload a pure list of Asset IDs or Roblox asset links and check them immediately.</div>';
       setupThumbnailLoader();
       updateLoadMoreBar(0, 0);
       syncSelectionUI();
@@ -3128,6 +3898,7 @@
       GM_registerMenuCommand('Asset Tracker: Open/close panel', function () { buildUI(); togglePanel(); });
       GM_registerMenuCommand('Asset Tracker: Open live full-page tracker', function () { buildUI(); openFullPageTracker(); });
       GM_registerMenuCommand('Asset Tracker: Scan this page', function () { lastScanSignature = ''; scanPage('manual', true); });
+      GM_registerMenuCommand('Asset Tracker: Add asset IDs/links…', function () { buildUI(); togglePanel(true); openManualAdd(); });
       GM_registerMenuCommand('Asset Tracker: Recheck pending now', function () { recheckPending('manual'); });
       GM_registerMenuCommand('Asset Tracker: Refresh approved assets now', function () {
         refreshApprovedAssets('approved-menu', { manual: true, forceBatch: true, limit: 100, announce: true });
@@ -3163,7 +3934,7 @@
   /* Debug/testing handle (also handy in DevTools: __RCAT__.scanPage('manual', true)) */
   try {
     var api = {
-      version: '1.4.0',
+      version: '1.5.0',
       get db() { return DB; },
       settings: settings,
       ui: ui,
@@ -3185,6 +3956,17 @@
       showSelectedDetails: showSelectedDetails,
       showMoreAssets: function () { buildUI(); return showMoreAssets(); },
       updateLoadMoreBar: updateLoadMoreBar,
+      normalizeManualAssetId: normalizeManualAssetId,
+      extractManualAssetFromLink: extractManualAssetFromLink,
+      manualEntryFromToken: manualEntryFromToken,
+      parseManualAssetEntries: parseManualAssetEntries,
+      addManualAssets: addManualAssets,
+      manualAddSummaryText: manualAddSummaryText,
+      openManualAdd: function () { buildUI(); togglePanel(true); return openManualAdd(); },
+      closeManualAdd: function () { buildUI(); return closeManualAdd(); },
+      updateManualAddPreview: function () { buildUI(); return updateManualAddPreview(); },
+      loadManualAddFile: loadManualAddFile,
+      submitManualAdd: function () { buildUI(); return submitManualAddFromUI(); },
       assetsForExport: assetsForExport,
       exportJSON: exportJSON,
       exportCSV: exportCSV,
