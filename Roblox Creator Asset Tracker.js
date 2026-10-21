@@ -25,7 +25,7 @@
 // @connect      create.roblox.com
 // @run-at       document-start
 // @noframes
-// @license      MIT
+// @license      Apache
 // ==/UserScript==
 (function () {
   'use strict';
